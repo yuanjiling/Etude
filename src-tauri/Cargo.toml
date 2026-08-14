@@ -5,6 +5,14 @@ description = "画谱桌面应用"
 authors = ["Etude"]
 edition = "2021"
 
+[[bin]]
+name = "etude"
+path = "src/main.rs"
+
+[[bin]]
+name = "Uninstall"
+path = "src/bin/uninstaller.rs"
+
 [lib]
 name = "etude_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -24,3 +32,4 @@ tauri-plugin-dialog = "2.7.2"
 once_cell = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
 tokio = { version = "1", features = ["sync"] }
+rusqlite = { version = "0.32", features = ["bundled"] }

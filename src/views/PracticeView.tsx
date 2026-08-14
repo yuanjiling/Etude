@@ -17,6 +17,7 @@ import {
   GENERAL_TAG_GROUPS,
   matchesBranchTags,
   GENERAL_REFERENCE_CATEGORIES,
+  getSetDetailText,
 } from '../utils/tagCatalog';
 
 const TIME_PRESETS = [0.5, 1, 2, 5, 10];
@@ -69,11 +70,13 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [activeContentPage, setActiveContentPage] = useState<(typeof CONTENT_TAGS)[number]>('完整人物');
 
-  const activeIncludeTags = sessionType === 'progressive' && activeStageIdx !== null
-    ? progressiveStages[activeStageIdx]?.includeTags || []
+  const isFilterDisabled = sessionType === 'progressive' && activeStageIdx === null;
+
+  const activeIncludeTags = sessionType === 'progressive'
+    ? (activeStageIdx !== null ? (progressiveStages[activeStageIdx]?.includeTags || []) : [])
     : includeTags;
-  const activeExcludeTags = sessionType === 'progressive' && activeStageIdx !== null
-    ? progressiveStages[activeStageIdx]?.excludeTags || []
+  const activeExcludeTags = sessionType === 'progressive'
+    ? (activeStageIdx !== null ? (progressiveStages[activeStageIdx]?.excludeTags || []) : [])
     : excludeTags;
 
   const selectedContentModes = activeIncludeTags.filter(t => CONTENT_TAGS.includes(t as any));
@@ -145,13 +148,16 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
       setImageCount(set.config.imageCount || 20);
       setIsTimeLimited(!!set.config.singleTimeSec);
       setIsCountLimited(!!set.config.imageCount);
+      setActiveStageIdx(null);
     } else {
       setProgressiveStages(set.config.progressiveStages || []);
+      setActiveStageIdx(0);
     }
     setActiveSetId(set.id);
   };
 
   const toggleTag = (tag: string, mode: 'include' | 'exclude') => {
+    if (isFilterDisabled) return;
     if (sessionType === 'progressive' && activeStageIdx !== null) {
       const stages = [...progressiveStages];
       const stage = { ...stages[activeStageIdx] };
@@ -189,6 +195,7 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
   };
 
   const replaceCurrentTags = (nextInclude: string[], nextExclude: string[]) => {
+    if (isFilterDisabled) return;
     if (sessionType === 'progressive' && activeStageIdx !== null) {
       setProgressiveStages(stages => stages.map((stage, index) => (
         index === activeStageIdx
@@ -204,6 +211,7 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
   };
 
   const selectContent = (content: (typeof CONTENT_TAGS)[number]) => {
+    if (isFilterDisabled) return;
     const isSelected = activeIncludeTags.includes(content);
     const isActivePage = activeContentPage === content;
     
@@ -228,6 +236,7 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
   };
 
   const togglePersonCount = (countTag: string, mode: 'include' | 'exclude') => {
+    if (isFilterDisabled) return;
     if (sessionType === 'progressive' && activeStageIdx !== null) {
       toggleTag(countTag, mode);
       return;
@@ -425,8 +434,13 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
                               : 'text-stone-600 dark:text-zinc-400 hover:bg-stone-50 dark:hover:bg-zinc-700/50 hover:text-stone-800 dark:hover:text-zinc-200'
                           }`}
                         >
-                          {set.name}
-                          {activeSetId === set.id && <Check size={14} />}
+                          <div className="text-left min-w-0 flex-1 pr-2">
+                            <div className="truncate">{set.name}</div>
+                            <div className="text-[9px] font-medium text-stone-400 dark:text-zinc-500 truncate">
+                              {getSetDetailText(set.config)}
+                            </div>
+                          </div>
+                          {activeSetId === set.id && <Check size={14} className="shrink-0" />}
                         </button>
                       ))}
                     </div>
@@ -460,7 +474,7 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
             <div className="text-[10px] font-semibold text-stone-500">模式</div>
             <div className="inline-flex w-fit p-0.5 rounded-md border border-black/10 dark:border-white/10">
               <button onClick={() => { setSessionType('single'); setActiveStageIdx(null); }} className={`h-6 px-3 rounded-[4px] text-[10px] font-bold transition-colors ${sessionType === 'single' ? 'bg-stone-800 dark:bg-zinc-100 text-white dark:text-zinc-900' : 'text-stone-500'}`}>固定时长</button>
-              <button onClick={() => setSessionType('progressive')} className={`h-6 px-3 rounded-[4px] text-[10px] font-bold transition-colors ${sessionType === 'progressive' ? 'bg-stone-800 dark:bg-zinc-100 text-white dark:text-zinc-900' : 'text-stone-500'}`}>Class Mode</button>
+              <button onClick={() => { setSessionType('progressive'); setActiveStageIdx(0); }} className={`h-6 px-3 rounded-[4px] text-[10px] font-bold transition-colors ${sessionType === 'progressive' ? 'bg-stone-800 dark:bg-zinc-100 text-white dark:text-zinc-900' : 'text-stone-500'}`}>Class Mode</button>
             </div>
           </div>
           <AnimatePresence mode="wait" initial={false}>
@@ -483,17 +497,23 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
           </AnimatePresence>
         </div>
 
-        <div className="space-y-2.5 [@media(min-height:700px)]:space-y-4">
+        <div className={`space-y-2.5 [@media(min-height:700px)]:space-y-4 transition-all duration-200 ${isFilterDisabled ? 'opacity-40 pointer-events-none select-none grayscale-[20%]' : ''}`}>
           <div className="flex items-end justify-between">
             <div>
               <h2 className="text-[13px] font-bold">内容筛选</h2>
-              <div className="text-[9px] text-stone-500/70">左键包含 · 右键排除</div>
+              <div className="text-[9px] text-stone-500/70">
+                {isFilterDisabled ? '请在上方选择阶段进行配置' : '左键包含 · 右键排除'}
+              </div>
             </div>
             <div className="flex items-center gap-2">
-              {(activeIncludeTags.length > 0 || activeExcludeTags.length > 0) && (
+              {!isFilterDisabled && (activeIncludeTags.length > 0 || activeExcludeTags.length > 0) && (
                 <button onClick={() => replaceCurrentTags([], [])} className="text-[9px] font-bold text-stone-500 hover:text-stone-800 dark:hover:text-zinc-200">清除筛选</button>
               )}
-              {sessionType === 'progressive' && activeStageIdx !== null && <span className="text-[9px] font-bold text-stone-500">正在设置阶段 {activeStageIdx + 1}</span>}
+              {isFilterDisabled ? (
+                <span className="text-[9px] font-bold text-amber-600 dark:text-amber-400">未选择阶段 · 筛选已冻结</span>
+              ) : (
+                sessionType === 'progressive' && activeStageIdx !== null && <span className="text-[9px] font-bold text-stone-500">正在设置阶段 {activeStageIdx + 1}</span>
+              )}
             </div>
           </div>
           <div className="grid grid-cols-[38px_1fr] items-center gap-2">
@@ -551,6 +571,18 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
               </motion.div>
             )}
           </AnimatePresence>
+
+          {settings.customTagGroups && settings.customTagGroups.filter(g => g.tags.length > 0).length > 0 && (
+            <motion.div layout className="space-y-1.5 pt-2 border-t border-black/5 dark:border-white/5 min-w-0">
+              <div className="flex items-center justify-between">
+                <h3 className="text-[9px] font-bold tracking-wide text-stone-400 dark:text-zinc-500">自定义分组</h3>
+                <span className="text-[8px] text-stone-400 font-semibold">{settings.customTags?.length || 0} 个标签</span>
+              </div>
+              <div className="space-y-1.5 [@media(min-height:700px)]:space-y-2">
+                {settings.customTagGroups.filter(g => g.tags.length > 0).map(renderCategory)}
+              </div>
+            </motion.div>
+          )}
         </div>
 
         <motion.button

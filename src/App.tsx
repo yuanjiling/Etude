@@ -7,12 +7,100 @@ import { SetsView } from './views/SetsView';
 import { HistoryView } from './views/HistoryView';
 import { PracticeWindow } from './views/PracticeWindow';
 import { SettingsView } from './views/SettingsView';
-import { Layout, Image as ImageIcon, Layers, Clock, Settings, Moon, Sun, Pin, Minus, X } from 'lucide-react';
+import { Layout, Image as ImageIcon, Layers, Clock, Settings, Moon, Sun, Pin, Minus, X, FolderOpen } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { PhysicalPosition, PhysicalSize } from '@tauri-apps/api/dpi';
+import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
 
 import { toggleAlwaysOnTop, setAlwaysOnTop, minimizeWindow, closeWindow, startDraggingWindow, startRightClickDrag, isTauriEnvironment } from './utils/tauriWindow';
+
+type LibrarySetupStatus = {
+  configured: boolean;
+  libraryPath?: string;
+};
+
+const LibrarySetupGate: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [state, setState] = useState<'checking' | 'required' | 'ready' | 'error'>(
+    isTauriEnvironment() ? 'checking' : 'ready',
+  );
+  const [error, setError] = useState<string>();
+  const [isChoosing, setIsChoosing] = useState(false);
+
+  const checkStatus = async () => {
+    if (!isTauriEnvironment()) return;
+    setState('checking');
+    setError(undefined);
+    try {
+      const status = await invoke<LibrarySetupStatus>('get_library_status');
+      setState(status.configured ? 'ready' : 'required');
+    } catch (reason) {
+      setError(String(reason));
+      setState('error');
+    }
+  };
+
+  useEffect(() => {
+    void checkStatus();
+  }, []);
+
+  const chooseDirectory = async () => {
+    setIsChoosing(true);
+    setError(undefined);
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: '选择画谱图库目录',
+      });
+      if (!selected || Array.isArray(selected)) return;
+      await invoke<LibrarySetupStatus>('set_library_directory', { path: selected });
+      setState('ready');
+    } catch (reason) {
+      setError(String(reason));
+      setState('required');
+    } finally {
+      setIsChoosing(false);
+    }
+  };
+
+  if (state === 'ready') return <>{children}</>;
+
+  return (
+    <div className="w-screen h-screen bg-stone-100 dark:bg-zinc-950 text-stone-800 dark:text-zinc-100 flex items-center justify-center p-6">
+      <div className="w-full max-w-sm rounded-2xl border border-black/5 dark:border-white/10 bg-white/80 dark:bg-zinc-900/80 shadow-xl p-7 text-center">
+        <div className="mx-auto mb-5 h-14 w-14 rounded-2xl bg-stone-900 text-white dark:bg-white dark:text-zinc-900 flex items-center justify-center">
+          <FolderOpen size={25} />
+        </div>
+        <h1 className="text-lg font-bold">选择图库目录</h1>
+        <p className="mt-2 text-xs leading-5 text-stone-500 dark:text-zinc-400">
+          画谱会读取并管理这个目录中的图片。建议选择空间充足的数据盘，原图不会写入应用数据库。
+        </p>
+        {error && <p className="mt-4 text-xs text-red-500 break-all">{error}</p>}
+        {state === 'checking' ? (
+          <div className="mt-6 text-xs text-stone-400">正在检查图库设置…</div>
+        ) : (
+          <div className="mt-6 flex flex-col gap-2">
+            <button
+              type="button"
+              onClick={chooseDirectory}
+              disabled={isChoosing}
+              className="h-10 rounded-xl bg-stone-900 text-white dark:bg-white dark:text-zinc-900 text-xs font-bold disabled:opacity-50"
+            >
+              {isChoosing ? '正在选择…' : '选择图库目录'}
+            </button>
+            {state === 'error' && (
+              <button type="button" onClick={checkStatus} className="h-8 text-xs text-stone-500 dark:text-zinc-400">
+                重新检查
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
 
 const BottomNav: React.FC<{ active: ViewMode; onNavigate: (v: ViewMode) => void }> = ({ active, onNavigate }) => {
   const { darkMode, toggleDarkMode } = useAppContext();
@@ -288,7 +376,9 @@ export default function App() {
 
   return (
     <AppProvider>
-      <MainContent />
+      <LibrarySetupGate>
+        <MainContent />
+      </LibrarySetupGate>
     </AppProvider>
   );
 }

@@ -1,16 +1,18 @@
 import React, { useEffect, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { motion, AnimatePresence } from 'motion/react';
-import { Check, Copy, FolderOpen, FlipHorizontal, Palette, LayoutGrid, MousePointer2, MoreHorizontal, X } from 'lucide-react';
+import { Check, Copy, FolderOpen, FlipHorizontal, Palette, LayoutGrid, MousePointer2, MoreHorizontal, X, Plus, AlertCircle, ChevronDown, Tag, Trash2 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { open } from '@tauri-apps/plugin-dialog';
 import { FocusedPracticeImage } from '../components/FocusedPracticeImage';
 import type { FocusRegion, ImageRecord } from '../types';
 import { DEFAULT_PRACTICE_SHORTCUTS, formatShortcut, PRACTICE_SHORTCUTS, shortcutFromKeyboardEvent, type PracticeShortcutAction } from '../utils/shortcuts';
+import { BUILTIN_TAG_CATEGORIES, isBuiltinTag, compactVisualTagLabel } from '../utils/tagCatalog';
 
 type LibraryStatus = {
-  libraryPath: string;
+  libraryPath?: string;
+  configured: boolean;
   taggerPath: string;
   pythonVersion?: string;
   taggingReady: boolean;
@@ -104,6 +106,74 @@ export const SettingsView = () => {
   const [recordingShortcut, setRecordingShortcut] = useState<PracticeShortcutAction | null>(null);
   const [shortcutError, setShortcutError] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState('0.1.2');
+  const [newGroupName, setNewGroupName] = useState('');
+  const [groupInputError, setGroupInputError] = useState<string | null>(null);
+  const [newTagInputs, setNewTagInputs] = useState<Record<string, string>>({});
+  const [tagInputErrors, setTagInputErrors] = useState<Record<string, string>>({});
+  const [showNativeTags, setShowNativeTags] = useState(false);
+
+  const customGroups = settings.customTagGroups || [];
+
+  const handleCreateGroup = (event?: React.FormEvent) => {
+    if (event) event.preventDefault();
+    const trimmed = newGroupName.trim();
+    if (!trimmed) return;
+    if (trimmed.length > 16) {
+      setGroupInputError('分组名称不能超过 16 个字符');
+      return;
+    }
+    if (customGroups.some(g => g.name === trimmed)) {
+      setGroupInputError('该分组名称已存在');
+      return;
+    }
+    const newGroup = {
+      id: `group_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`,
+      name: trimmed,
+      tags: [],
+    };
+    updateSettings({ customTagGroups: [...customGroups, newGroup] });
+    setNewGroupName('');
+    setGroupInputError(null);
+  };
+
+  const handleDeleteGroup = (groupId: string) => {
+    updateSettings({
+      customTagGroups: customGroups.filter(g => g.id !== groupId),
+    });
+  };
+
+  const handleAddTagToGroup = (groupId: string, event?: React.FormEvent) => {
+    if (event) event.preventDefault();
+    const inputVal = (newTagInputs[groupId] || '').trim();
+    if (!inputVal) return;
+    if (inputVal.length > 24) {
+      setTagInputErrors(prev => ({ ...prev, [groupId]: '标签名称不能超过 24 个字符' }));
+      return;
+    }
+    if (isBuiltinTag(inputVal)) {
+      setTagInputErrors(prev => ({ ...prev, [groupId]: '该标签为系统原生标签，无需重复添加' }));
+      return;
+    }
+    const allCustomTags = customGroups.flatMap(g => g.tags);
+    if (allCustomTags.includes(inputVal)) {
+      setTagInputErrors(prev => ({ ...prev, [groupId]: '该自定义标签已存在' }));
+      return;
+    }
+
+    const updatedGroups = customGroups.map(g => (
+      g.id === groupId ? { ...g, tags: [...g.tags, inputVal] } : g
+    ));
+    updateSettings({ customTagGroups: updatedGroups });
+    setNewTagInputs(prev => ({ ...prev, [groupId]: '' }));
+    setTagInputErrors(prev => ({ ...prev, [groupId]: '' }));
+  };
+
+  const handleDeleteTagFromGroup = (groupId: string, tagToDelete: string) => {
+    const updatedGroups = customGroups.map(g => (
+      g.id === groupId ? { ...g, tags: g.tags.filter(t => t !== tagToDelete) } : g
+    ));
+    updateSettings({ customTagGroups: updatedGroups });
+  };
 
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => undefined);
@@ -285,7 +355,7 @@ export const SettingsView = () => {
               {isActive && (
                 <motion.div 
                   layoutId="settingsTab" 
-                  className="absolute inset-0 bg-white dark:bg-zinc-800 border border-black/5 dark:border-white/5 rounded-md shadow-sm"
+                  className="absolute inset-0 bg-white dark:bg-zinc-800 border border-black/5 dark:border-white/5 rounded-md"
                   transition={{ type: 'spring', stiffness: 500, damping: 35 }}
                 />
               )}
@@ -341,7 +411,7 @@ export const SettingsView = () => {
                       <div className="text-xs font-semibold text-stone-800 dark:text-zinc-200">主题</div>
                       <div className="grid grid-cols-3 rounded-lg bg-black/[0.035] p-0.5 dark:bg-white/[0.05]">
                         {([['system', '跟随系统'], ['light', '浅色'], ['dark', '深色']] as const).map(([theme, label]) => (
-                          <button key={theme} onClick={() => updateSettings({ theme })} className={`h-7 rounded-md text-[9px] font-bold transition-all ${settings.theme === theme ? 'bg-white text-stone-900 shadow-sm dark:bg-zinc-700 dark:text-white' : 'text-stone-400 hover:text-stone-700 dark:hover:text-zinc-300'}`}>{label}</button>
+                          <button key={theme} onClick={() => updateSettings({ theme })} className={`h-7 rounded-md text-[9px] font-bold transition-all ${settings.theme === theme ? 'bg-white text-stone-900 border border-black/5 dark:border-white/5 dark:bg-zinc-700 dark:text-white' : 'text-stone-400 hover:text-stone-700 dark:hover:text-zinc-300'}`}>{label}</button>
                         ))}
                       </div>
                     </div>
@@ -358,6 +428,184 @@ export const SettingsView = () => {
                     </div>
                   </div>
                 </section>
+
+                <section className="space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-[10px] font-bold tracking-wide text-stone-400 dark:text-zinc-500">标签管理</h3>
+                    <span className="text-[9px] text-stone-400">原生标签不可改动 · 支持自定义标签分组</span>
+                  </div>
+
+                  <div className="rounded-xl border border-black/5 bg-white/60 p-3.5 space-y-3 dark:border-white/5 dark:bg-zinc-800/60">
+                    {/* 自定义标签分组 */}
+                    <div className="space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <div className="text-xs font-bold text-stone-800 dark:text-zinc-200 flex items-center gap-1.5">
+                          自定义标签
+                          <span className="text-[9px] font-semibold px-1.5 py-0.2 rounded-full bg-black/5 dark:bg-white/10 text-stone-500 dark:text-zinc-400">
+                            {customGroups.reduce((sum, g) => sum + g.tags.length, 0)} 个标签 · {customGroups.length} 个分组
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* 分组列表 */}
+                      {customGroups.length === 0 ? (
+                        <div className="h-10 flex items-center justify-center text-[10px] text-stone-400 dark:text-zinc-500 rounded-lg bg-black/[0.02] dark:bg-black/20 border border-black/5 dark:border-white/5">
+                          暂无自定义分组，在下方输入名称新建分组
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          {customGroups.map(group => (
+                            <div key={group.id} className="p-2.5 rounded-lg bg-black/[0.02] dark:bg-black/20 border border-black/5 dark:border-white/5 space-y-2">
+                              {/* 分组头部 */}
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="text-[10px] font-bold text-stone-700 dark:text-zinc-300">{group.name}</span>
+                                  <span className="text-[8px] text-stone-400 font-semibold">{group.tags.length} 个标签</span>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteGroup(group.id)}
+                                  className="text-[9px] text-stone-400 hover:text-red-500 flex items-center gap-0.5 transition-colors cursor-pointer"
+                                  title={`删除分组 "${group.name}"`}
+                                >
+                                  <Trash2 size={10} />
+                                  <span>删除分组</span>
+                                </button>
+                              </div>
+
+                              {/* 分组标签列表 */}
+                              <div className="flex flex-wrap gap-1 min-h-6 items-center">
+                                {group.tags.length === 0 ? (
+                                  <span className="text-[9px] text-stone-400 dark:text-zinc-500">暂无标签</span>
+                                ) : (
+                                  group.tags.map(tag => (
+                                    <span
+                                      key={tag}
+                                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-black/[0.035] dark:bg-white/[0.05] text-[9px] font-medium text-stone-600 dark:text-zinc-400 border border-black/5 dark:border-white/5 select-none"
+                                    >
+                                      <span>{tag}</span>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDeleteTagFromGroup(group.id, tag)}
+                                        className="w-3.5 h-3.5 flex items-center justify-center rounded text-stone-400 hover:text-red-500 hover:bg-black/5 dark:hover:bg-white/10 transition-colors"
+                                        title={`删除标签 "${tag}"`}
+                                      >
+                                        <X size={10} strokeWidth={2.5} />
+                                      </button>
+                                    </span>
+                                  ))
+                                )}
+                              </div>
+
+                              {/* 添加标签至该分组 */}
+                              <form onSubmit={e => handleAddTagToGroup(group.id, e)} className="flex gap-1 pt-1 border-t border-black/5 dark:border-white/5">
+                                <input
+                                  type="text"
+                                  value={newTagInputs[group.id] || ''}
+                                  onChange={e => {
+                                    setNewTagInputs(prev => ({ ...prev, [group.id]: e.target.value }));
+                                    if (tagInputErrors[group.id]) setTagInputErrors(prev => ({ ...prev, [group.id]: '' }));
+                                  }}
+                                  placeholder="添加标签..."
+                                  className="flex-1 h-7 px-2 rounded-md bg-black/[0.03] dark:bg-white/[0.04] border border-black/5 dark:border-white/5 text-[10px] font-medium text-stone-800 dark:text-zinc-200 placeholder:text-stone-400 dark:placeholder:text-zinc-500 focus:outline-none focus:border-stone-400 dark:focus:border-zinc-500 transition-colors"
+                                />
+                                <button
+                                  type="submit"
+                                  disabled={!newTagInputs[group.id]?.trim()}
+                                  className="h-7 px-2.5 rounded-md bg-stone-800 dark:bg-zinc-200 text-white dark:text-zinc-900 text-[10px] font-bold flex items-center gap-1 hover:opacity-90 active:scale-95 disabled:opacity-30 disabled:pointer-events-none transition-all cursor-pointer"
+                                >
+                                  <Plus size={11} strokeWidth={2.5} />
+                                  添加
+                                </button>
+                              </form>
+                              {tagInputErrors[group.id] && (
+                                <div className="text-[8px] text-red-500 flex items-center gap-1 font-medium">
+                                  <AlertCircle size={10} /> {tagInputErrors[group.id]}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* 新建分组输入栏 */}
+                      <form onSubmit={handleCreateGroup} className="flex gap-1.5 pt-1">
+                        <input
+                          type="text"
+                          value={newGroupName}
+                          onChange={e => {
+                            setNewGroupName(e.target.value);
+                            if (groupInputError) setGroupInputError(null);
+                          }}
+                          placeholder="新建分组名称..."
+                          className="flex-1 h-8 px-3 rounded-lg bg-black/[0.04] dark:bg-white/[0.06] border border-black/5 dark:border-white/10 text-xs font-medium text-stone-800 dark:text-zinc-200 placeholder:text-stone-400 dark:placeholder:text-zinc-500 focus:outline-none focus:border-stone-400 dark:focus:border-zinc-500 transition-colors"
+                        />
+                        <button
+                          type="submit"
+                          disabled={!newGroupName.trim()}
+                          className="h-8 px-3 rounded-lg bg-stone-800 dark:bg-zinc-100 text-white dark:text-zinc-900 text-xs font-bold flex items-center gap-1 hover:opacity-90 active:scale-95 disabled:opacity-30 disabled:pointer-events-none transition-all cursor-pointer"
+                        >
+                          <Plus size={13} strokeWidth={2.5} />
+                          新建分组
+                        </button>
+                      </form>
+                      {groupInputError && (
+                        <div className="text-[9px] text-red-500 flex items-center gap-1 font-medium">
+                          <AlertCircle size={11} /> {groupInputError}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* 原生标签列表（折叠/展开查看） */}
+                    <div className="pt-2 border-t border-black/5 dark:border-white/5">
+                      <button
+                        type="button"
+                        onClick={() => setShowNativeTags(!showNativeTags)}
+                        className="w-full flex items-center justify-between text-left group cursor-pointer"
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs font-bold text-stone-800 dark:text-zinc-200">系统原生标签</span>
+                          <span className="text-[9px] px-1.5 py-0.2 rounded bg-stone-200/70 dark:bg-zinc-700/70 text-stone-600 dark:text-zinc-400 font-semibold">内置 · 不可修改</span>
+                        </div>
+                        <div className="flex items-center gap-1 text-[9px] font-semibold text-stone-400 group-hover:text-stone-700 dark:group-hover:text-zinc-200 transition-colors">
+                          <span>{showNativeTags ? '收起' : '展开查看'}</span>
+                          <ChevronDown size={13} className={`transition-transform duration-200 ${showNativeTags ? 'rotate-180' : ''}`} />
+                        </div>
+                      </button>
+
+                      <AnimatePresence>
+                        {showNativeTags && (
+                          <motion.div
+                            initial={{ opacity: 0, height: 0 }}
+                            animate={{ opacity: 1, height: 'auto' }}
+                            exit={{ opacity: 0, height: 0 }}
+                            transition={{ duration: 0.2 }}
+                            className="overflow-hidden mt-2.5 space-y-2"
+                          >
+                            <div className="p-2.5 rounded-lg bg-black/[0.02] dark:bg-black/20 border border-black/5 dark:border-white/5 space-y-2">
+                              {BUILTIN_TAG_CATEGORIES.map(category => (
+                                <div key={category.name} className="flex items-start gap-2">
+                                  <div className="w-12 pt-0.5 text-[9px] font-bold text-stone-400 shrink-0">{category.name}</div>
+                                  <div className="flex flex-wrap gap-1">
+                                    {category.tags.map(tag => (
+                                      <span
+                                        key={tag}
+                                        className="px-1.5 py-0.5 rounded bg-black/[0.035] dark:bg-white/[0.05] text-[9px] font-medium text-stone-600 dark:text-zinc-400 border border-black/5 dark:border-white/5 select-none"
+                                      >
+                                        {compactVisualTagLabel(tag)}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </div>
+                  </div>
+                </section>
+
                 <div className="mt-auto pt-4 text-center text-[8px] leading-relaxed text-stone-400 dark:text-zinc-600">
                   <div className="font-semibold">画谱 Etude</div>
                   <div>Version {appVersion}</div>
@@ -531,7 +779,7 @@ export const SettingsView = () => {
                         key={item.label}
                         onClick={item.toggle}
                         aria-pressed={item.active}
-                        className={`flex h-9 min-w-0 items-center justify-center gap-1 rounded-md text-[9px] font-bold transition-all ${item.active ? 'bg-white text-stone-900 shadow-sm dark:bg-zinc-700 dark:text-white' : 'text-stone-400 hover:text-stone-700 dark:text-zinc-500 dark:hover:text-zinc-300'}`}
+                        className={`flex h-9 min-w-0 items-center justify-center gap-1 rounded-md text-[9px] font-bold transition-all ${item.active ? 'bg-white text-stone-900 border border-black/5 dark:border-white/5 dark:bg-zinc-700 dark:text-white' : 'text-stone-400 hover:text-stone-700 dark:text-zinc-500 dark:hover:text-zinc-300'}`}
                       >
                         <item.icon size={12} className="shrink-0" />
                         <span className="truncate">{item.label}</span>
@@ -560,7 +808,7 @@ export const SettingsView = () => {
                             <button
                               key={c.color}
                               onClick={() => updateSettings({ gridColor: c.color })}
-                              className={`h-5 w-5 rounded-full border shadow-sm transition-transform ${settings.gridColor === c.color ? 'scale-110 ring-2 ring-stone-400 ring-offset-2 ring-offset-stone-50 dark:ring-zinc-400 dark:ring-offset-zinc-900' : 'border-black/10 hover:scale-110 dark:border-white/10'}`}
+                              className={`h-5 w-5 rounded-full border transition-transform ${settings.gridColor === c.color ? 'scale-110 ring-2 ring-stone-400 ring-offset-2 ring-offset-stone-50 dark:ring-zinc-400 dark:ring-offset-zinc-900' : 'border-black/10 hover:scale-110 dark:border-white/10'}`}
                               style={{ backgroundColor: c.color }}
                               title={c.label}
                             />

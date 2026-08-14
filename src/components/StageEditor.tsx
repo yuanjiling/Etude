@@ -123,6 +123,7 @@ export const StageEditor: React.FC<{
   onSelectStage?: (idx: number | null) => void;
 }> = ({ stages, onChange, activeStageIdx = null, onSelectStage }) => {
   const addStage = () => {
+    const nextIdx = stages.length;
     onChange([...stages, {
       id: Math.random().toString(36).substr(2, 9),
       durationSec: 300,
@@ -130,6 +131,9 @@ export const StageEditor: React.FC<{
       includeTags: [],
       excludeTags: [],
     }]);
+    if (onSelectStage) {
+      onSelectStage(nextIdx);
+    }
   };
 
   const removeStage = (idx: number, e: React.MouseEvent) => {
@@ -138,7 +142,7 @@ export const StageEditor: React.FC<{
     newStages.splice(idx, 1);
     onChange(newStages);
     if (activeStageIdx === idx && onSelectStage) {
-      onSelectStage(null);
+      onSelectStage(newStages.length > 0 ? Math.min(idx, newStages.length - 1) : null);
     } else if (activeStageIdx !== null && activeStageIdx > idx && onSelectStage) {
       onSelectStage(activeStageIdx - 1);
     }

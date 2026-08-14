@@ -9,7 +9,7 @@ import { FocusedPracticeImage } from '../components/FocusedPracticeImage';
 import { useAppContext } from '../context/AppContext';
 import { POSE_MODEL_VERSION } from '../services/poseFocus';
 import { CONTENT_ROUTER_VERSION, VISUAL_ANALYSIS_VERSION } from '../services/contentAnalysis';
-import { FocusRegion, ImageRecord } from '../types';
+import { FocusRegion, ImageRecord, CustomTagGroup } from '../types';
 import { getVirtualFocusTags } from '../utils/focusRegion';
 import {
   ASPECT_RATIO_TAGS,
@@ -317,6 +317,7 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
   const [showImportMenu, setShowImportMenu] = useState(false);
   const [editingImage, setEditingImage] = useState<ImageRecord | null>(null);
   const [editingFocusRegion, setEditingFocusRegion] = useState<FocusRegion | undefined>();
+  const [isBatchEditing, setIsBatchEditing] = useState(false);
   const [previewZoomItem, setPreviewZoomItem] = useState<{ image: ImageRecord; focusRegion?: FocusRegion } | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
@@ -476,6 +477,7 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
     [displayItems, galleryViewportWidth, thumbnailWidth],
   );
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const selectedImages = useMemo(() => images.filter(img => selectedIdSet.has(img.id)), [images, selectedIdSet]);
 
   const importPaths = async (directory: boolean) => {
     setShowImportMenu(false);
@@ -892,7 +894,7 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
               />
             )}
             {showFilters && (
-              <TagCategoryList selected={activeTags} onToggle={toggleFilterTag} />
+              <TagCategoryList selected={activeTags} onToggle={toggleFilterTag} customTagGroups={settings.customTagGroups} />
             )}
           </AnimatePresence>
         </div>
@@ -933,8 +935,12 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
                     onSelect={() => toggleSelection(item.id)}
                     onPreview={() => setPreviewZoomItem({ image: item.image, focusRegion: item.focusRegion })}
                     onEdit={() => {
-                      setEditingImage(item.image);
-                      setEditingFocusRegion(item.focusRegion);
+                      if (selectedIds.length > 1 && selectedIdSet.has(item.id)) {
+                        setIsBatchEditing(true);
+                      } else {
+                        setEditingImage(item.image);
+                        setEditingFocusRegion(item.focusRegion);
+                      }
                     }}
                   />
                 </div>
@@ -960,11 +966,19 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
             initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 16 }}
             className="absolute left-4 right-4 bottom-3 z-20 flex items-center gap-2 p-2 rounded-2xl bg-zinc-900/95 dark:bg-zinc-100/95 backdrop-blur-xl text-white dark:text-zinc-900 shadow-2xl"
           >
-            <button onClick={() => setSelectedIds([])} className="w-7 h-7 flex items-center justify-center rounded-lg bg-white/10 dark:bg-black/5"><X size={13} /></button>
+            <button onClick={() => setSelectedIds([])} className="w-7 h-7 flex items-center justify-center rounded-lg bg-white/10 dark:bg-black/5 hover:bg-white/20 dark:hover:bg-black/10 transition-colors"><X size={13} /></button>
             <div className="min-w-0 flex-1">
               <div className="text-[10px] font-bold">已选 {selectedIds.length} 张</div>
               <div className="text-[8px] opacity-60">按选择顺序练习</div>
             </div>
+            <button
+              onClick={() => setIsBatchEditing(true)}
+              className="h-7 flex items-center gap-1.5 px-2.5 rounded-lg bg-white/15 dark:bg-black/10 text-[10px] font-bold hover:bg-white/25 dark:hover:bg-black/15 transition-colors cursor-pointer"
+              title="批量编辑标签"
+            >
+              <Tags size={12} />
+              <span>编辑标签</span>
+            </button>
             <label className="h-7 flex items-center gap-1 px-2 rounded-lg bg-white/10 dark:bg-black/5 text-[9px]">
               <input
                 type="number" min={0} step={0.5} value={practiceMinutes}
@@ -981,10 +995,48 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
       </AnimatePresence>
 
       <AnimatePresence>
+        {isBatchEditing && selectedImages.length > 0 && (
+          <BatchTagEditor
+            images={selectedImages}
+            customTagGroups={settings.customTagGroups || []}
+            onClose={() => setIsBatchEditing(false)}
+            onApply={(tagsToAdd, tagsToRemove) => {
+              if (tagsToAdd.length === 0 && tagsToRemove.length === 0) {
+                setIsBatchEditing(false);
+                return;
+              }
+              const updatedList: ImageRecord[] = [];
+              selectedImages.forEach(img => {
+                const nextTags = Array.from(
+                  new Set(
+                    img.tags
+                      .filter(t => !tagsToRemove.includes(t))
+                      .concat(tagsToAdd)
+                  )
+                );
+                updateImageTags(img.id, nextTags);
+                updatedList.push({
+                  ...img,
+                  tags: nextTags,
+                  tagStatus: 'tagged',
+                  tagError: undefined,
+                });
+              });
+              upsertImages(updatedList);
+              setIsBatchEditing(false);
+              setNotice(`已批量更新 ${selectedImages.length} 张图片的标签`);
+              window.setTimeout(() => setNotice(null), 2500);
+            }}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
         {editingImage && (
           <TagEditor
             image={editingImage}
             focusRegion={editingFocusRegion}
+            customTagGroups={settings.customTagGroups || []}
             onClose={() => { setEditingImage(null); setEditingFocusRegion(undefined); }}
             onRoute={scope => routeImageContent(editingImage, scope)}
             onSave={tags => {
@@ -1212,27 +1264,50 @@ const FolderList = ({ folders, selected, total, onSelect }: {
   );
 };
 
-const TagCategoryList = ({ selected, onToggle }: { selected: string[]; onToggle: (tag: string) => void }) => (
-  <motion.div
-    initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }}
-    className="overflow-hidden"
-  >
-    <div className="mt-2 max-h-44 overflow-y-auto p-2.5 space-y-2 rounded-xl bg-black/[0.03] dark:bg-white/[0.04] border border-black/5 dark:border-white/5 [&::-webkit-scrollbar]:hidden">
-      {TAG_CATEGORIES.map(category => (
-        <div key={category.name} className="flex items-start gap-2">
-          <div className="w-7 pt-1 text-[9px] font-bold text-stone-500 shrink-0">{category.name}</div>
-          <div className="flex flex-wrap gap-1">
-            {category.tags.map(tag => (
-              <button key={tag} onClick={() => onToggle(tag)} className={`min-w-[34px] rounded-md border px-2 py-1 text-[9px] font-medium transition-colors ${selected.includes(tag) ? 'border-white/80 bg-white text-stone-900 shadow-[0_0_14px_rgba(255,255,255,0.95),0_2px_8px_rgba(0,0,0,0.10)] dark:border-white/10 dark:bg-zinc-700 dark:text-zinc-100 dark:shadow-[0_0_14px_rgba(255,255,255,0.18)]' : 'border-black/10 bg-white/35 text-stone-600 hover:border-black/25 dark:border-white/10 dark:bg-transparent dark:text-zinc-400 dark:hover:border-white/25'}`}>
-                {compactVisualTagLabel(tag)}
-              </button>
-            ))}
+const TagCategoryList = ({
+  selected,
+  onToggle,
+  customTagGroups = [],
+}: {
+  selected: string[];
+  onToggle: (tag: string) => void;
+  customTagGroups?: CustomTagGroup[];
+}) => {
+  const categories = useMemo(() => [
+    ...TAG_CATEGORIES,
+    ...(customTagGroups || []).filter(g => g.tags.length > 0).map(g => ({ name: g.name, tags: g.tags })),
+  ], [customTagGroups]);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }}
+      className="overflow-hidden"
+    >
+      <div className="mt-2 max-h-48 overflow-y-auto p-2.5 space-y-2 rounded-xl bg-black/[0.03] dark:bg-white/[0.04] border border-black/5 dark:border-white/5 [&::-webkit-scrollbar]:hidden">
+        {categories.map(category => (
+          <div key={category.name} className="flex items-start gap-2">
+            <div className="w-12 pt-1 text-[9px] font-bold text-stone-500 shrink-0">{category.name}</div>
+            <div className="flex flex-wrap gap-1">
+              {category.tags.map(tag => (
+                <button
+                  key={tag}
+                  onClick={() => onToggle(tag)}
+                  className={`min-w-[34px] rounded-md border px-2 py-1 text-[9px] font-medium transition-colors cursor-pointer ${
+                    selected.includes(tag)
+                      ? 'border-white/80 bg-white text-stone-900 shadow-[0_0_14px_rgba(255,255,255,0.95),0_2px_8px_rgba(0,0,0,0.10)] dark:border-white/10 dark:bg-zinc-700 dark:text-zinc-100 dark:shadow-[0_0_14px_rgba(255,255,255,0.18)]'
+                      : 'border-black/10 bg-white/35 text-stone-600 hover:border-black/25 dark:border-white/10 dark:bg-transparent dark:text-zinc-400 dark:hover:border-white/25'
+                  }`}
+                >
+                  {compactVisualTagLabel(tag)}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
-      ))}
-    </div>
-  </motion.div>
-);
+        ))}
+      </div>
+    </motion.div>
+  );
+};
 
 const ImageCard: React.FC<{
   itemId: string;
@@ -1368,9 +1443,19 @@ const FadeInThumbnail = ({ src, alt }: { src: string; alt: string }) => {
   );
 };
 
-const TagEditor = ({ image, focusRegion, onClose, onRoute, onSave, onClearMetadata, onRemove }: {
+const TagEditor = ({
+  image,
+  focusRegion,
+  customTagGroups = [],
+  onClose,
+  onRoute,
+  onSave,
+  onClearMetadata,
+  onRemove,
+}: {
   image: ImageRecord;
   focusRegion?: FocusRegion;
+  customTagGroups?: CustomTagGroup[];
   onClose: () => void;
   onRoute: (scope: ManualContentRoute) => void;
   onSave: (tags: string[]) => void;
@@ -1383,11 +1468,14 @@ const TagEditor = ({ image, focusRegion, onClose, onRoute, onSave, onClearMetada
   const [currentScope, setCurrentScope] = useState<ManualContentRoute>(initialScope);
   const [tags, setTags] = useState(() => normalizeEditorTags(image.tags));
 
+  const allCustomTags = useMemo(() => customTagGroups.flatMap(g => g.tags), [customTagGroups]);
+  const customGroupNames = useMemo(() => new Set(customTagGroups.map(g => g.name)), [customTagGroups]);
+
   const handleScopeChange = (nextScope: ManualContentRoute) => {
     setCurrentScope(nextScope);
     if (nextScope === 'general_reference') {
       setTags(current => {
-        const genTags = current.filter(t => GENERAL_REFERENCE_TAGS.has(t) && t !== '完整人物' && t !== '人体局部');
+        const genTags = current.filter(t => (GENERAL_REFERENCE_TAGS.has(t) || allCustomTags.includes(t)) && t !== '完整人物' && t !== '人体局部');
         return genTags.includes('综合参考') ? genTags : ['综合参考', ...genTags];
       });
     } else {
@@ -1402,24 +1490,31 @@ const TagEditor = ({ image, focusRegion, onClose, onRoute, onSave, onClearMetada
   const toggleTag = (categoryName: string, categoryTags: string[], tag: string) => {
     setTags(current => {
       if (current.includes(tag)) return current.filter(item => item !== tag);
-      if (MULTI_SELECT_EDITOR_CATEGORIES.has(categoryName)) return [...current, tag];
+      if (customGroupNames.has(categoryName) || MULTI_SELECT_EDITOR_CATEGORIES.has(categoryName)) return [...current, tag];
       return [...current.filter(item => !categoryTags.includes(item)), tag];
     });
   };
 
-  const visibleCategories = EDITABLE_TAG_CATEGORIES.filter(category => {
-    if (focusRegion) {
-      return !GENERAL_REFERENCE_CATEGORY_NAMES.has(category.name) && category.name !== '部位' && category.name !== '内容';
-    }
-    if (currentScope === 'general_reference') {
-      return GENERAL_REFERENCE_CATEGORY_NAMES.has(category.name);
-    }
-    return !GENERAL_REFERENCE_CATEGORY_NAMES.has(category.name);
-  });
+  const customCategories = useMemo(() => (
+    (customTagGroups || []).filter(g => g.tags.length > 0).map(g => ({ name: g.name, tags: g.tags }))
+  ), [customTagGroups]);
+
+  const visibleCategories = [
+    ...EDITABLE_TAG_CATEGORIES.filter(category => {
+      if (focusRegion) {
+        return !GENERAL_REFERENCE_CATEGORY_NAMES.has(category.name) && category.name !== '部位' && category.name !== '内容';
+      }
+      if (currentScope === 'general_reference') {
+        return GENERAL_REFERENCE_CATEGORY_NAMES.has(category.name);
+      }
+      return !GENERAL_REFERENCE_CATEGORY_NAMES.has(category.name);
+    }),
+    ...customCategories,
+  ];
 
   const handleSave = () => {
     const finalTags = currentScope === 'general_reference'
-      ? ['综合参考', ...tags.filter(t => GENERAL_REFERENCE_TAGS.has(t) && t !== '完整人物' && t !== '人体局部' && t !== '综合参考')]
+      ? ['综合参考', ...tags.filter(t => (GENERAL_REFERENCE_TAGS.has(t) || allCustomTags.includes(t)) && t !== '完整人物' && t !== '人体局部' && t !== '综合参考')]
       : tags.filter(t => !GENERAL_REFERENCE_TAGS.has(t) && t !== '综合参考');
     onSave(finalTags);
   };
@@ -1472,7 +1567,7 @@ const TagEditor = ({ image, focusRegion, onClose, onRoute, onSave, onClearMetada
               <div className="mb-1.5 text-[9px] uppercase tracking-widest font-bold text-stone-500">{category.name}</div>
               <div className="flex flex-wrap gap-1.5">
                 {category.tags.map(tag => (
-                  <button key={tag} onClick={() => toggleTag(category.name, category.tags, tag)} className={`px-2.5 py-1.5 rounded-lg text-[10px] font-medium transition-colors ${tags.includes(tag) ? 'bg-stone-800 dark:bg-zinc-100 text-white dark:text-zinc-900' : 'bg-black/5 dark:bg-white/5 text-stone-500 dark:text-zinc-400'}`}>
+                  <button key={tag} onClick={() => toggleTag(category.name, category.tags, tag)} className={`px-2.5 py-1.5 rounded-lg text-[10px] font-medium transition-colors cursor-pointer ${tags.includes(tag) ? 'bg-stone-800 dark:bg-zinc-100 text-white dark:text-zinc-900' : 'bg-black/5 dark:bg-white/5 text-stone-500 dark:text-zinc-400'}`}>
                     {compactVisualTagLabel(tag)}
                   </button>
                 ))}
@@ -1490,6 +1585,231 @@ const TagEditor = ({ image, focusRegion, onClose, onRoute, onSave, onClearMetada
             </button>
           </div>
           <button onClick={handleSave} className="w-full py-2.5 rounded-xl bg-stone-900 dark:bg-zinc-100 text-white dark:text-zinc-900 text-xs font-bold">保存标签</button>
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+};
+
+const BatchTagEditor = ({
+  images,
+  customTagGroups = [],
+  onClose,
+  onApply,
+}: {
+  images: ImageRecord[];
+  customTagGroups?: CustomTagGroup[];
+  onClose: () => void;
+  onApply: (tagsToAdd: string[], tagsToRemove: string[]) => void;
+}) => {
+  const [tagActions, setTagActions] = useState<Record<string, '+' | '-' | undefined>>({});
+
+  const tagCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    images.forEach(img => {
+      img.tags.forEach(t => {
+        counts.set(t, (counts.get(t) || 0) + 1);
+      });
+    });
+    return counts;
+  }, [images]);
+
+  const total = images.length;
+
+  const handleTagClick = (tag: string) => {
+    const currentAction = tagActions[tag];
+    const initialCount = tagCounts.get(tag) || 0;
+
+    let nextAction: '+' | '-' | undefined;
+    if (!currentAction) {
+      if (initialCount === 0) {
+        nextAction = '+';
+      } else if (initialCount === total) {
+        nextAction = '-';
+      } else {
+        nextAction = '+';
+      }
+    } else if (currentAction === '+') {
+      nextAction = '-';
+    } else if (currentAction === '-') {
+      nextAction = undefined;
+    }
+
+    setTagActions(prev => ({
+      ...prev,
+      [tag]: nextAction,
+    }));
+  };
+
+  const tagsToAdd = useMemo(() => (
+    Object.entries(tagActions)
+      .filter(([_, action]) => action === '+')
+      .map(([tag]) => tag)
+  ), [tagActions]);
+
+  const tagsToRemove = useMemo(() => (
+    Object.entries(tagActions)
+      .filter(([_, action]) => action === '-')
+      .map(([tag]) => tag)
+  ), [tagActions]);
+
+  const hasChanges = tagsToAdd.length > 0 || tagsToRemove.length > 0;
+
+  const renderBatchTag = (tag: string) => {
+    const action = tagActions[tag];
+    const initialCount = tagCounts.get(tag) || 0;
+
+    const badgeText = compactVisualTagLabel(tag);
+    let stateLabel = '';
+    let btnStyle = '';
+
+    if (action === '+') {
+      stateLabel = '+添加';
+      btnStyle = 'bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-900 font-bold border-stone-900 dark:border-white shadow-sm';
+    } else if (action === '-') {
+      stateLabel = '−移除';
+      btnStyle = 'bg-red-50 text-red-600 dark:bg-red-950/40 dark:text-red-300 border-red-300 dark:border-red-900 line-through opacity-80';
+    } else {
+      if (initialCount === total) {
+        stateLabel = '全选已含';
+        btnStyle = 'bg-black/10 dark:bg-white/15 text-stone-900 dark:text-white border-black/15 dark:border-white/20 font-semibold';
+      } else if (initialCount > 0) {
+        stateLabel = `${initialCount}/${total}`;
+        btnStyle = 'bg-amber-500/10 text-amber-700 dark:text-amber-300 border-dashed border-amber-500/40 font-semibold';
+      } else {
+        btnStyle = 'bg-black/[0.03] dark:bg-white/[0.04] text-stone-500 dark:text-zinc-400 border-black/5 dark:border-white/5 hover:border-black/20 dark:hover:border-white/20';
+      }
+    }
+
+    return (
+      <button
+        key={tag}
+        type="button"
+        onClick={() => handleTagClick(tag)}
+        className={`px-2.5 py-1.5 rounded-lg text-[10px] font-medium transition-all border flex items-center gap-1 cursor-pointer active:scale-95 ${btnStyle}`}
+      >
+        <span>{action === '+' ? `+ ${badgeText}` : action === '-' ? `− ${badgeText}` : badgeText}</span>
+        {stateLabel && (
+          <span className="text-[8px] opacity-75 font-semibold">
+            {stateLabel}
+          </span>
+        )}
+      </button>
+    );
+  };
+
+  const activeCustomGroups = (customTagGroups || []).filter(g => g.tags.length > 0);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="absolute inset-0 z-40 flex items-end bg-black/30 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <motion.div
+        initial={{ y: 40 }}
+        animate={{ y: 0 }}
+        exit={{ y: 40 }}
+        onClick={e => e.stopPropagation()}
+        className="w-full max-h-[82%] flex flex-col rounded-t-2xl bg-stone-50 dark:bg-zinc-900 border-t border-black/5 dark:border-white/10 shadow-2xl"
+      >
+        <div className="flex items-center justify-between px-4 py-3 border-b border-black/5 dark:border-white/5 shrink-0">
+          <div>
+            <div className="text-sm font-bold text-stone-800 dark:text-zinc-100 flex items-center gap-2">
+              批量编辑标签
+              <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-stone-800 dark:bg-zinc-100 text-white dark:text-zinc-900">
+                已选 {total} 张
+              </span>
+            </div>
+            <div className="text-[9px] text-stone-400 mt-0.5">
+              点击切换状态：+全部添加 / −全部移除 / 保持原样
+            </div>
+          </div>
+          <button onClick={onClose} className="w-7 h-7 flex items-center justify-center rounded-lg bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-colors">
+            <X size={13} />
+          </button>
+        </div>
+
+        {/* Selected Thumbnails Strip */}
+        <div className="px-4 py-2 bg-black/[0.02] dark:bg-black/20 border-b border-black/5 dark:border-white/5 shrink-0 flex items-center gap-1.5 overflow-x-auto [&::-webkit-scrollbar]:hidden">
+          {images.slice(0, 16).map(img => (
+            <div key={img.id} className="w-8 h-10 rounded-md overflow-hidden bg-zinc-200 dark:bg-zinc-800 shrink-0 border border-black/5 dark:border-white/5 shadow-xs">
+              <img src={img.url} className="w-full h-full object-cover" alt="" loading="lazy" />
+            </div>
+          ))}
+          {images.length > 16 && (
+            <div className="h-10 px-2 flex items-center justify-center rounded-md bg-black/5 dark:bg-white/5 text-[9px] font-bold text-stone-400 shrink-0">
+              +{images.length - 16}
+            </div>
+          )}
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3.5 [&::-webkit-scrollbar]:hidden">
+          {/* Custom Tag Groups */}
+          {activeCustomGroups.length > 0 && (
+            <div className="space-y-2.5">
+              <div className="text-[9px] font-bold uppercase tracking-wider text-stone-400 dark:text-zinc-500">
+                自定义标签分组
+              </div>
+              {activeCustomGroups.map(group => (
+                <div key={group.id} className="p-2.5 rounded-xl bg-white dark:bg-zinc-800/60 border border-black/5 dark:border-white/5 space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <div className="text-[10px] font-bold text-stone-700 dark:text-zinc-300">
+                      {group.name}
+                    </div>
+                    <span className="text-[8px] text-stone-400 font-semibold">{group.tags.length} 个标签</span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {group.tags.map(renderBatchTag)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Native Categories */}
+          <div className="space-y-3">
+            <div className="text-[9px] font-bold uppercase tracking-wider text-stone-400 dark:text-zinc-500">
+              原生分类标签
+            </div>
+            {EDITABLE_TAG_CATEGORIES.map(category => (
+              <div key={category.name}>
+                <div className="mb-1 text-[9px] font-bold text-stone-500">{category.name}</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {category.tags.map(renderBatchTag)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Footer Actions */}
+        <div className="p-3 border-t border-black/5 dark:border-white/5 bg-stone-50 dark:bg-zinc-900 space-y-2 shrink-0">
+          {(tagsToAdd.length > 0 || tagsToRemove.length > 0) && (
+            <div className="flex flex-wrap items-center gap-2 text-[9px] text-stone-500 font-medium px-1">
+              {tagsToAdd.length > 0 && <span className="text-emerald-600 dark:text-emerald-400 font-bold">将添加: {tagsToAdd.join('、')}</span>}
+              {tagsToRemove.length > 0 && <span className="text-red-500 font-bold">将移除: {tagsToRemove.join('、')}</span>}
+            </div>
+          )}
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="h-9 rounded-xl bg-black/5 dark:bg-white/5 text-stone-600 dark:text-zinc-300 text-xs font-bold hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              onClick={() => onApply(tagsToAdd, tagsToRemove)}
+              disabled={!hasChanges}
+              className="h-9 rounded-xl bg-stone-900 dark:bg-zinc-100 text-white dark:text-zinc-900 text-xs font-bold hover:opacity-90 active:scale-98 disabled:opacity-40 disabled:pointer-events-none transition-all shadow-sm cursor-pointer"
+            >
+              应用修改 ({total} 张)
+            </button>
+          </div>
         </div>
       </motion.div>
     </motion.div>

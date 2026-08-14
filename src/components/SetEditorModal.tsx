@@ -1,10 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { PracticeSet, SessionType, StageConfig } from '../types';
 import { X, Check, ChevronDown } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { StageEditor } from './StageEditor';
 import { ProgressSegmentedControl } from './ProgressSegmentedControl';
 import { COMPACT_VISUAL_TAG_LABELS, TAG_CATEGORIES } from '../utils/tagCatalog';
+import { useAppContext } from '../context/AppContext';
 
 const COMPACT_TAG_LABELS: Record<string, string> = {
   身体裁切: '裁切',
@@ -16,7 +17,6 @@ const COMPACT_TAG_LABELS: Record<string, string> = {
   骨盆臀部: '骨盆',
   ...COMPACT_VISUAL_TAG_LABELS,
 };
-
 const TIME_PRESETS = [0.5, 1, 2, 5, 10];
 const COUNT_PRESETS = [10, 20, 30, 50, 100];
 
@@ -26,6 +26,7 @@ export const SetEditorModal: React.FC<{
   onSave: (set: PracticeSet) => void;
   initialSet?: PracticeSet;
 }> = ({ isOpen, onClose, onSave, initialSet }) => {
+  const { settings } = useAppContext();
   const [name, setName] = useState('');
   const [includeTags, setIncludeTags] = useState<string[]>([]);
   const [excludeTags, setExcludeTags] = useState<string[]>([]);
@@ -37,6 +38,11 @@ export const SetEditorModal: React.FC<{
   const [progressiveStages, setProgressiveStages] = useState<StageConfig[]>([]);
   const [activeStageIdx, setActiveStageIdx] = useState<number | null>(null);
 
+  const categories = useMemo(() => [
+    ...TAG_CATEGORIES.filter(category => category.name !== '练习'),
+    ...(settings.customTagGroups || []).filter(g => g.tags.length > 0).map(g => ({ name: g.name, tags: g.tags })),
+  ], [settings.customTagGroups]);
+
   useEffect(() => {
     if (isOpen) {
       if (initialSet) {
@@ -44,6 +50,11 @@ export const SetEditorModal: React.FC<{
         setIncludeTags(initialSet.config.includeTags);
         setExcludeTags(initialSet.config.excludeTags || []);
         setSessionType(initialSet.config.sessionType);
+        if (initialSet.config.sessionType === 'progressive') {
+          setActiveStageIdx(0);
+        } else {
+          setActiveStageIdx(null);
+        }
         setSingleTimeMin(initialSet.config.singleTimeSec ? initialSet.config.singleTimeSec / 60 : 1);
         setImageCount(initialSet.config.imageCount || 20);
         setIsTimeLimited(!!initialSet.config.singleTimeSec);
@@ -54,6 +65,7 @@ export const SetEditorModal: React.FC<{
         setIncludeTags([]);
         setExcludeTags([]);
         setSessionType('single');
+        setActiveStageIdx(null);
         setSingleTimeMin(1);
         setImageCount(20);
         setIsTimeLimited(true);
@@ -66,7 +78,10 @@ export const SetEditorModal: React.FC<{
     }
   }, [isOpen, initialSet]);
 
+  const isFilterDisabled = sessionType === 'progressive' && activeStageIdx === null;
+
   const toggleTag = (tag: string, mode: 'include' | 'exclude') => {
+    if (isFilterDisabled) return;
     if (sessionType === 'progressive' && activeStageIdx !== null) {
       const stages = [...progressiveStages];
       const stage = { ...stages[activeStageIdx] };
@@ -157,13 +172,19 @@ export const SetEditorModal: React.FC<{
               </div>
 
               {/* Tags */}
-              <div className="order-3 space-y-2">
+              <div className={`order-3 space-y-2 transition-all duration-200 ${isFilterDisabled ? 'opacity-40 pointer-events-none select-none grayscale-[20%]' : ''}`}>
                 <div className="flex items-center justify-between">
-                  <label className="text-[10px] font-bold text-stone-500">{sessionType === 'progressive' && activeStageIdx !== null ? `阶段 ${activeStageIdx + 1} · 练习内容` : '练习内容'}</label>
-                  <span className="text-[9px] text-stone-500/70">右键排除</span>
+                  <label className="text-[10px] font-bold text-stone-500">
+                    {sessionType === 'progressive'
+                      ? (activeStageIdx !== null ? `阶段 ${activeStageIdx + 1} · 练习内容` : '练习内容（未选择阶段 · 筛选已冻结）')
+                      : '练习内容'}
+                  </label>
+                  <span className="text-[9px] text-stone-500/70">
+                    {isFilterDisabled ? '请先在下方选择阶段' : '右键排除'}
+                  </span>
                 </div>
                 <div className="flex flex-col gap-2 bg-white dark:bg-zinc-800 border border-black/5 dark:border-white/5 p-3 rounded-lg">
-                  {TAG_CATEGORIES.filter(category => category.name !== '练习').map(category => (
+                  {categories.map(category => (
                     <div key={category.name} className="flex gap-1.5 items-start">
                       <div className="w-7 shrink-0 pt-1 text-[10px] leading-none font-bold text-stone-500">{category.name}</div>
                       <div className="flex flex-wrap gap-1 flex-1">
@@ -223,7 +244,7 @@ export const SetEditorModal: React.FC<{
                       固定时长
                     </button>
                     <button
-                      onClick={() => setSessionType('progressive')}
+                      onClick={() => { setSessionType('progressive'); setActiveStageIdx(0); }}
                       className={`relative z-10 flex-1 py-1.5 text-[11px] font-bold ${sessionType === 'progressive' ? 'text-black dark:text-white' : 'text-stone-500'}`}
                     >
                       Class Mode

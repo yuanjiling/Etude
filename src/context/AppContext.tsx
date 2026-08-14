@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import { Channel, invoke } from '@tauri-apps/api/core';
-import { ImageRecord, PracticeSet, HistoryRecord, PracticeConfig, AppSettings } from '../types';
+import { ImageRecord, PracticeSet, HistoryRecord, PracticeConfig, AppSettings, CustomTagGroup } from '../types';
 import { MOCK_IMAGES, INITIAL_SETS } from '../data';
 import { analyzeContent, visualAnalysisTags } from '../services/contentAnalysis';
 import { mapModelTags } from '../utils/modelTags';
@@ -43,16 +43,16 @@ const AppContext = createContext<AppState | null>(null);
 import { DEFAULT_PRACTICE_SHORTCUTS } from '../utils/shortcuts';
 
 const DEFAULT_SETTINGS: AppSettings = {
-  settingsVersion: 4,
+  settingsVersion: 5,
   theme: 'system',
   preparationSec: 3,
-  transitionSec: 1,
+  transitionSec: 0,
   soundEnabled: true,
   defaultGrid: false,
   defaultFlip: false,
   defaultGrayscale: false,
   defaultClickThrough: false,
-  bgOpacity: 95,
+  bgOpacity: 100,
   canvasOpacity: 100,
   timerSize: 60,
   gridColor: 'white',
@@ -65,6 +65,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   rememberWindowBounds: true,
   windowBounds: undefined,
   shortcuts: DEFAULT_PRACTICE_SHORTCUTS,
+  customTagGroups: [],
+  customTags: [],
 };
 
 const loadSettings = (stored: unknown): AppSettings => {
@@ -73,6 +75,26 @@ const loadSettings = (stored: unknown): AppSettings => {
     Object.entries(DEFAULT_SETTINGS).map(([key, fallback]) => [key, source[key] ?? fallback]),
   ) as unknown as AppSettings;
   loaded.shortcuts = { ...DEFAULT_SETTINGS.shortcuts, ...(source.shortcuts as Partial<AppSettings['shortcuts']> | undefined) };
+
+  let customTagGroups: CustomTagGroup[] = [];
+  if (Array.isArray(source.customTagGroups)) {
+    customTagGroups = source.customTagGroups
+      .filter((g): g is Record<string, unknown> => typeof g === 'object' && g !== null && typeof g.name === 'string' && Boolean(g.name.trim()))
+      .map(g => ({
+        id: typeof g.id === 'string' && g.id ? g.id : `group_${Math.random().toString(36).substring(2, 9)}`,
+        name: (g.name as string).trim(),
+        tags: Array.isArray(g.tags) ? (g.tags as unknown[]).filter((t): t is string => typeof t === 'string' && Boolean(t.trim())).map(t => t.trim()) : [],
+      }));
+  } else if (Array.isArray(source.customTags) && source.customTags.length > 0) {
+    const oldTags = (source.customTags as unknown[]).filter((t): t is string => typeof t === 'string' && Boolean(t.trim())).map(t => t.trim());
+    if (oldTags.length > 0) {
+      customTagGroups = [{ id: 'custom_default', name: '自定义', tags: oldTags }];
+    }
+  }
+
+  loaded.customTagGroups = customTagGroups;
+  loaded.customTags = Array.from(new Set(customTagGroups.flatMap(g => g.tags)));
+
   if (!source.settingsVersion) {
     loaded.settingsVersion = DEFAULT_SETTINGS.settingsVersion;
     loaded.timerSize = 60;
@@ -96,37 +118,43 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [localizationTask, setLocalizationTask] = useState<LibraryTaskState>({ running: false, current: 0, total: 0 });
   const taggingRunningRef = useRef(false);
   const localizationRunningRef = useRef(false);
+  const persistenceEnabledRef = useRef(false);
 
   // Load Data
   useEffect(() => {
     const loadData = async () => {
       try {
-        const json = await invoke<string>('read_data');
+        const [json, settingsJson] = await Promise.all([
+          invoke<string>('read_app_state'),
+          invoke<string>('read_settings'),
+        ]);
         if (json && json !== '{}') {
           const data = JSON.parse(json);
           if (data.images) setImages(data.images);
           else setImages(MOCK_IMAGES);
-          
-          if (data.sets) setSets(data.sets);
-          else setSets(INITIAL_SETS);
-          
-          if (data.history) setHistory(data.history);
-          if (data.darkMode !== undefined) setDarkMode(data.darkMode);
-          if (data.settings) {
-            const nextSettings = loadSettings(data.settings);
-            if (!data.settings.theme && data.darkMode !== undefined) {
-              nextSettings.theme = data.darkMode ? 'dark' : 'light';
+
+          if (data.sets && Array.isArray(data.sets)) {
+            const hasOldDefault = data.sets.some((s: any) => (s.id === 's1' && s.name === '动态热身') || (s.id === 's2' && s.name === '头像速写'));
+            if (hasOldDefault) {
+              setSets(INITIAL_SETS);
+            } else {
+              setSets(data.sets);
             }
-            setSettings(nextSettings);
+          } else {
+            setSets(INITIAL_SETS);
           }
+
+          if (data.history) setHistory(data.history);
         } else {
           setImages(MOCK_IMAGES);
           setSets(INITIAL_SETS);
         }
+        setSettings(loadSettings(settingsJson && settingsJson !== '{}' ? JSON.parse(settingsJson) : undefined));
       } catch (err) {
         console.warn('Failed to load data from Tauri:', err);
         setImages(MOCK_IMAGES);
         setSets(INITIAL_SETS);
+        persistenceEnabledRef.current = true;
       } finally {
         setIsLoaded(true);
       }
@@ -134,19 +162,32 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     loadData();
   }, []);
 
-  // Save Data
+  // Save database-backed application data as one transaction.
   useEffect(() => {
-    if (!isLoaded) return;
+    if (!isLoaded || !persistenceEnabledRef.current) return;
     const saveTimer = window.setTimeout(async () => {
-      const data = { images, sets, history, darkMode, settings };
+      const data = { images, sets, history };
       try {
-        await invoke('write_data', { data: JSON.stringify(data) });
+        await invoke('write_app_state', { data: JSON.stringify(data) });
       } catch (err) {
-        console.warn('Failed to save data to Tauri:', err);
+        console.warn('Failed to save app state to SQLite:', err);
       }
     }, 500);
     return () => window.clearTimeout(saveTimer);
-  }, [images, sets, history, darkMode, settings, isLoaded]);
+  }, [images, sets, history, isLoaded]);
+
+  // Settings are intentionally independent from the library database.
+  useEffect(() => {
+    if (!isLoaded || !persistenceEnabledRef.current) return;
+    const saveTimer = window.setTimeout(async () => {
+      try {
+        await invoke('write_settings', { data: JSON.stringify(settings) });
+      } catch (err) {
+        console.warn('Failed to save settings:', err);
+      }
+    }, 500);
+    return () => window.clearTimeout(saveTimer);
+  }, [settings, isLoaded]);
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)');
@@ -161,7 +202,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [settings.theme]);
 
   const updateSettings = (newSettings: Partial<AppSettings>) => {
-    setSettings(prev => ({ ...prev, ...newSettings }));
+    setSettings(prev => {
+      const next = { ...prev, ...newSettings };
+      if (newSettings.customTagGroups && !newSettings.customTags) {
+        next.customTags = Array.from(new Set(newSettings.customTagGroups.flatMap(g => g.tags)));
+      }
+      return next;
+    });
   };
 
   const toggleDarkMode = () => updateSettings({ theme: darkMode ? 'light' : 'dark' });

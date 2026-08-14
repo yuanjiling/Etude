@@ -6,6 +6,8 @@ import { PracticeSet } from '../types';
 import { motion } from 'motion/react';
 import { SetEditorModal } from '../components/SetEditorModal';
 
+import { getSetDetailText, formatDurationLabel, compactVisualTagLabel } from '../utils/tagCatalog';
+
 export const SetsView: React.FC<{ onStart: (config: any) => void }> = ({ onStart }) => {
   const { sets, saveSet, deleteSet, settings } = useAppContext();
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -23,23 +25,19 @@ export const SetsView: React.FC<{ onStart: (config: any) => void }> = ({ onStart
   return (
     <>
       <div className="px-4 pt-4 pb-4 gap-3 h-full flex flex-col">
-        <header className="flex flex-col gap-0.5 shrink-0">
-          <div className="flex items-center gap-3">
-            <h1 className="text-xl font-bold tracking-tight">练习配置</h1>
-            <button 
-              onClick={() => handleEdit()}
-              className="flex items-center justify-center w-7 h-7 bg-zinc-800 dark:bg-zinc-100 text-zinc-100 dark:text-zinc-900 rounded-lg hover:scale-105 active:scale-95 transition-all"
-            >
-              <Plus size={16} strokeWidth={2.5} />
-            </button>
-          </div>
-          <p className="text-stone-500 dark:text-white/50 text-[11px] font-medium">保存常用练习配置</p>
+        <header className="flex items-center gap-3 shrink-0">
+          <h1 className="text-xl font-bold tracking-tight">练习配置</h1>
+          <button 
+            onClick={() => handleEdit()}
+            className="px-2 py-1 bg-black/5 dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/20 text-xs font-bold rounded-md flex items-center gap-1 transition-colors"
+          >
+            <Plus size={12} /> 新建
+          </button>
         </header>
 
+        {/* Sets List */}
         <motion.div 
-          className="flex flex-col gap-2 flex-1 pb-12 overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
-          initial="hidden"
-          animate="show"
+          className="flex-1 overflow-y-auto flex flex-col gap-2.5 pr-1 scrollbar-hide"
           variants={{
             hidden: { opacity: 0 },
             show: {
@@ -47,6 +45,8 @@ export const SetsView: React.FC<{ onStart: (config: any) => void }> = ({ onStart
               transition: { staggerChildren: 0.05 }
             }
           }}
+          initial="hidden"
+          animate="show"
         >
           {sets.map(set => (
             <SetCard 
@@ -57,6 +57,7 @@ export const SetsView: React.FC<{ onStart: (config: any) => void }> = ({ onStart
               onDelete={() => handleDelete(set)}
             />
           ))}
+
           {sets.length === 0 && (
             <button onClick={() => handleEdit()} className="mt-8 py-8 rounded-xl border border-dashed border-black/10 dark:border-white/10 text-[11px] font-medium text-stone-500 hover:bg-black/[0.02] dark:hover:bg-white/[0.03]">
               还没有练习配置 · 点击新建
@@ -76,9 +77,7 @@ export const SetsView: React.FC<{ onStart: (config: any) => void }> = ({ onStart
 };
 
 const SetCard: React.FC<{ set: PracticeSet; onStart: () => void; onEdit: () => void; onDelete: () => void }> = ({ set, onStart, onEdit, onDelete }) => {
-  const detail = set.config.sessionType === 'single'
-    ? `${set.config.singleTimeSec ? `${set.config.singleTimeSec} 秒/张` : '不限时'} · ${set.config.imageCount === 999 ? '全部图片' : `${set.config.imageCount || 0} 张`}`
-    : `${set.config.progressiveStages?.length || 0} 个阶段`;
+  const detail = getSetDetailText(set.config);
   return (
     <motion.div
       variants={{
@@ -120,15 +119,51 @@ const SetCard: React.FC<{ set: PracticeSet; onStart: () => void; onEdit: () => v
             </motion.button>
           </div>
         </div>
-        {set.config.includeTags.length > 0 && (
-          <div className="flex items-center gap-1 overflow-hidden">
-            {set.config.includeTags.slice(0, 5).map(tag => (
-              <span key={tag} className="shrink-0 px-1.5 py-0.5 bg-black/5 dark:bg-white/10 text-[9px] font-medium rounded-md">{tag}</span>
-            ))}
-            {set.config.includeTags.length > 5 && (
-              <span className="text-[9px] text-stone-500">+{set.config.includeTags.length - 5}</span>
-            )}
-          </div>
+        {set.config.sessionType === 'progressive' ? (
+          set.config.progressiveStages && set.config.progressiveStages.length > 0 && (
+            <div className="flex flex-col gap-1 pt-1 border-t border-black/5 dark:border-white/5">
+              {set.config.progressiveStages.map((stage, idx) => {
+                const stageTags = stage.includeTags && stage.includeTags.length > 0
+                  ? stage.includeTags
+                  : (set.config.includeTags && set.config.includeTags.length > 0 ? set.config.includeTags : []);
+                const durationText = formatDurationLabel(stage.durationSec);
+                return (
+                  <div key={stage.id || idx} className="flex items-center gap-1.5 overflow-hidden text-[9px]">
+                    <span className="shrink-0 font-bold text-stone-400 dark:text-zinc-500 text-[8px]">
+                      阶段 {idx + 1} ({durationText} · {stage.count}张):
+                    </span>
+                    {stageTags.length === 0 ? (
+                      <span className="shrink-0 text-stone-400 dark:text-zinc-500 text-[8px]">全部图库</span>
+                    ) : (
+                      <>
+                        {stageTags.slice(0, 5).map(tag => (
+                          <span key={tag} className="shrink-0 px-1.5 py-0.5 bg-black/5 dark:bg-white/10 text-[8px] font-medium rounded-md">
+                            {compactVisualTagLabel(tag)}
+                          </span>
+                        ))}
+                        {stageTags.length > 5 && (
+                          <span className="text-[8px] text-stone-500">+{stageTags.length - 5}</span>
+                        )}
+                      </>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )
+        ) : (
+          set.config.includeTags && set.config.includeTags.length > 0 && (
+            <div className="flex items-center gap-1 overflow-hidden pt-1 border-t border-black/5 dark:border-white/5">
+              {set.config.includeTags.slice(0, 6).map(tag => (
+                <span key={tag} className="shrink-0 px-1.5 py-0.5 bg-black/5 dark:bg-white/10 text-[9px] font-medium rounded-md">
+                  {compactVisualTagLabel(tag)}
+                </span>
+              ))}
+              {set.config.includeTags.length > 6 && (
+                <span className="text-[9px] text-stone-500">+{set.config.includeTags.length - 6}</span>
+              )}
+            </div>
+          )
         )}
       </GlassCard>
     </motion.div>

@@ -26,27 +26,16 @@ export const MOCK_IMAGES: ImageRecord[] = [
 export const INITIAL_SETS: PracticeSet[] = [
   {
     id: 's1',
-    name: '动态热身',
+    name: '半小时 1',
     config: {
-      includeTags: ['完整人物', '全身', '动态'],
-      excludeTags: ['坐'],
+      includeTags: ['完整人物', '全身'],
+      excludeTags: [],
       sessionType: 'progressive',
       progressiveStages: [
-        { durationSec: 30, count: 5 },
-        { durationSec: 60, count: 5 },
-        { durationSec: 120, count: 2 }
+        { durationSec: 60, count: 5, includeTags: ['完整人物', '全身'], excludeTags: [] },
+        { durationSec: 120, count: 4, includeTags: ['完整人物', '全身'], excludeTags: [] },
+        { durationSec: 300, count: 2, includeTags: ['完整人物', '全身'], excludeTags: [] },
       ]
-    }
-  },
-  {
-    id: 's2',
-    name: '头像速写',
-    config: {
-      includeTags: ['完整人物', '头肩肖像'],
-      excludeTags: [],
-      sessionType: 'single',
-      singleTimeSec: 120,
-      imageCount: 5
     }
   }
 ];

@@ -1,3 +1,6 @@
+mod database;
+mod settings;
+
 #[tauri::command]
 fn start_native_drag(window: tauri::Window) {
     std::thread::spawn(move || {
@@ -243,7 +246,8 @@ struct LibraryFile {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LibraryStatus {
-    library_path: String,
+    library_path: Option<String>,
+    configured: bool,
     tagger_path: String,
     python_version: Option<String>,
     tagging_ready: bool,
@@ -273,13 +277,6 @@ fn save_storage_config(app: &tauri::AppHandle, config: &StorageConfig) -> Result
     let path = get_storage_config_path(app)?;
     let data = serde_json::to_string_pretty(config).map_err(|error| error.to_string())?;
     fs::write(path, data).map_err(|error| error.to_string())
-}
-
-fn default_library_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
-        .map(|path| path.join("library"))
-        .map_err(|error| error.to_string())
 }
 
 fn get_tagger_dir(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -406,8 +403,7 @@ fn get_library_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let path = config
         .library_path
         .map(PathBuf::from)
-        .map(Ok)
-        .unwrap_or_else(|| default_library_dir(app))?;
+        .ok_or_else(|| "请先选择图库目录".to_string())?;
     fs::create_dir_all(&path).map_err(|error| error.to_string())?;
     app.asset_protocol_scope()
         .allow_directory(&path, true)
@@ -472,19 +468,38 @@ fn collect_images(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> 
     Ok(())
 }
 
-fn thumbnail_path_for(path: &Path, library_dir: &Path) -> PathBuf {
-    let relative = path.strip_prefix(library_dir).unwrap_or(path);
-    let mut thumbnail = library_dir.join(".thumbnails").join(relative);
-    let thumbnail_name = format!(
-        "{}.thumb.jpg",
-        thumbnail.file_name().unwrap_or_default().to_string_lossy()
-    );
-    thumbnail.set_file_name(thumbnail_name);
-    thumbnail
+fn thumbnail_cache_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("thumbnails");
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    app.asset_protocol_scope()
+        .allow_directory(&directory, true)
+        .map_err(|error| error.to_string())?;
+    Ok(directory)
 }
 
-fn ensure_thumbnail(path: &Path, library_dir: &Path) -> Result<PathBuf, String> {
-    let thumbnail_path = thumbnail_path_for(path, library_dir);
+fn thumbnail_cache_key(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    #[cfg(target_os = "windows")]
+    let path = path.to_lowercase();
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn thumbnail_path_for(path: &Path, cache_dir: &Path) -> PathBuf {
+    let key = thumbnail_cache_key(path);
+    cache_dir.join(&key[..2]).join(format!("{key}.jpg"))
+}
+
+fn ensure_thumbnail(path: &Path, cache_dir: &Path) -> Result<PathBuf, String> {
+    let thumbnail_path = thumbnail_path_for(path, cache_dir);
     let source_modified = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .map_err(|error| error.to_string())?;
@@ -502,18 +517,31 @@ fn ensure_thumbnail(path: &Path, library_dir: &Path) -> Result<PathBuf, String> 
     let source = image::open(path)
         .map_err(|error| format!("无法生成 {} 的缩略图：{error}", path.display()))?;
     let thumbnail = source.thumbnail(512, 512).to_rgb8();
-    let output = fs::File::create(&thumbnail_path)
-        .map_err(|error| format!("无法创建 {}：{error}", thumbnail_path.display()))?;
-    let mut encoder =
-        image::codecs::jpeg::JpegEncoder::new_with_quality(BufWriter::new(output), 82);
-    encoder
-        .encode_image(&thumbnail)
-        .map_err(|error| format!("无法保存 {} 的缩略图：{error}", path.display()))?;
+    let temporary_path = thumbnail_path.with_extension("jpg.tmp");
+    let encode_result = (|| {
+        let output = fs::File::create(&temporary_path)
+            .map_err(|error| format!("无法创建 {}：{error}", temporary_path.display()))?;
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(BufWriter::new(output), 82);
+        encoder
+            .encode_image(&thumbnail)
+            .map_err(|error| format!("无法保存 {} 的缩略图：{error}", path.display()))
+    })();
+    if let Err(error) = encode_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    if thumbnail_path.exists() {
+        fs::remove_file(&thumbnail_path)
+            .map_err(|error| format!("无法更新 {}：{error}", thumbnail_path.display()))?;
+    }
+    fs::rename(&temporary_path, &thumbnail_path)
+        .map_err(|error| format!("无法写入 {}：{error}", thumbnail_path.display()))?;
     Ok(thumbnail_path)
 }
 
-fn current_thumbnail(path: &Path, library_dir: &Path) -> Option<PathBuf> {
-    let thumbnail_path = thumbnail_path_for(path, library_dir);
+fn current_thumbnail(path: &Path, cache_dir: &Path) -> Option<PathBuf> {
+    let thumbnail_path = thumbnail_path_for(path, cache_dir);
     let source_modified = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()?;
@@ -523,7 +551,7 @@ fn current_thumbnail(path: &Path, library_dir: &Path) -> Option<PathBuf> {
     (thumbnail_modified >= source_modified).then_some(thumbnail_path)
 }
 
-fn library_file(path: &Path, library_dir: &Path) -> Result<LibraryFile, String> {
+fn library_file(path: &Path, library_dir: &Path, cache_dir: &Path) -> Result<LibraryFile, String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     let (pixel_width, pixel_height) = image::image_dimensions(path).unwrap_or((0, 0));
     let modified_at = metadata
@@ -534,7 +562,7 @@ fn library_file(path: &Path, library_dir: &Path) -> Result<LibraryFile, String> 
         .unwrap_or_default();
     Ok(LibraryFile {
         path: path.to_string_lossy().to_string(),
-        thumbnail_path: current_thumbnail(path, library_dir)
+        thumbnail_path: current_thumbnail(path, cache_dir)
             .map(|thumbnail| thumbnail.to_string_lossy().to_string()),
         relative_path: path
             .strip_prefix(library_dir)
@@ -555,12 +583,13 @@ fn library_file(path: &Path, library_dir: &Path) -> Result<LibraryFile, String> 
 
 fn scan_library_files(app: &tauri::AppHandle) -> Result<Vec<LibraryFile>, String> {
     let library_dir = get_library_dir(app)?;
+    let cache_dir = thumbnail_cache_dir(app)?;
     let mut paths = Vec::new();
     collect_images(&library_dir, &mut paths)?;
     paths.sort();
     paths
         .iter()
-        .map(|path| library_file(path, &library_dir))
+        .map(|path| library_file(path, &library_dir, &cache_dir))
         .collect()
 }
 
@@ -604,7 +633,8 @@ async fn get_library_thumbnail(
         if !image.starts_with(&library_dir) || !image.is_file() || !is_supported_image(&image) {
             return Err("只能为当前图库中的图片生成缩略图".to_string());
         }
-        ensure_thumbnail(&image, &library_dir)
+        let cache_dir = thumbnail_cache_dir(&app)?;
+        ensure_thumbnail(&image, &cache_dir)
             .map(|thumbnail| thumbnail.to_string_lossy().to_string())
     })
     .await
@@ -622,7 +652,7 @@ fn remove_library_image(app: tauri::AppHandle, image_path: String) -> Result<(),
     if !image.starts_with(&library_dir) || !image.is_file() || !is_supported_image(&image) {
         return Err("只能移除应用图库目录中的图片文件".to_string());
     }
-    let thumbnail = thumbnail_path_for(&image, &library_dir);
+    let thumbnail = thumbnail_path_for(&image, &thumbnail_cache_dir(&app)?);
     fs::remove_file(&image).map_err(|error| format!("移除图片失败：{error}"))?;
     let _ = fs::remove_file(thumbnail);
     Ok(())
@@ -633,6 +663,7 @@ fn import_library_files(
     source_paths: Vec<String>,
 ) -> Result<Vec<LibraryFile>, String> {
     let library_dir = get_library_dir(app)?;
+    let cache_dir = thumbnail_cache_dir(app)?;
     let mut imported = Vec::new();
     for source_path in source_paths {
         let root = PathBuf::from(source_path);
@@ -665,7 +696,7 @@ fn import_library_files(
                 fs::copy(&source, &destination)
                     .map_err(|error| format!("导入 {} 失败: {error}", source.display()))?;
             }
-            imported.push(library_file(&destination, &library_dir)?);
+            imported.push(library_file(&destination, &library_dir, &cache_dir)?);
         }
     }
     Ok(imported)
@@ -708,7 +739,7 @@ fn open_tagger_folder(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn get_library_status(app: tauri::AppHandle) -> Result<LibraryStatus, String> {
-    let library_dir = get_library_dir(&app)?;
+    let library_path = load_storage_config(&app)?.library_path;
     let tagger_dir = get_tagger_dir(&app)?;
     let tagging_model = find_tagging_model(&app);
     let runtime_installed = tagging_runtime_installed(&app);
@@ -717,42 +748,14 @@ fn get_library_status(app: tauri::AppHandle) -> Result<LibraryStatus, String> {
             .then(|| "未找到自动打标运行时，请放入 runtime/windows/python.exe".to_string())
     });
     Ok(LibraryStatus {
-        library_path: library_dir.to_string_lossy().to_string(),
+        configured: library_path.is_some(),
+        library_path,
         tagger_path: tagger_dir.to_string_lossy().to_string(),
         python_version: None,
         tagging_ready: tagging_error.is_none(),
         tagging_error,
         localization_ready: true,
     })
-}
-
-fn get_data_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
-        .map(|mut path| {
-            if !path.exists() {
-                fs::create_dir_all(&path).ok();
-            }
-            path.push("app_data.json");
-            path
-        })
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn read_data(app: tauri::AppHandle) -> Result<String, String> {
-    let path = get_data_file_path(&app)?;
-    if path.exists() {
-        fs::read_to_string(path).map_err(|e| e.to_string())
-    } else {
-        Ok("{}".to_string())
-    }
-}
-
-#[tauri::command]
-fn write_data(app: tauri::AppHandle, data: String) -> Result<(), String> {
-    let path = get_data_file_path(&app)?;
-    fs::write(path, data).map_err(|e| e.to_string())
 }
 
 use std::io::{BufRead, BufReader};
@@ -852,8 +855,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_native_drag,
             set_window_click_through,
-            read_data,
-            write_data,
+            database::read_app_state,
+            database::write_app_state,
+            settings::read_settings,
+            settings::write_settings,
             scan_library,
             count_library_images,
             get_library_thumbnail,
@@ -870,7 +875,6 @@ pub fn run() {
             toggle_practice_locked
         ])
         .setup(|app| {
-            let _ = get_library_dir(app.handle());
             let _ = get_tagger_dir(app.handle());
             Ok(())
         })
@@ -879,4 +883,31 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod thumbnail_tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_uses_the_full_source_path() {
+        let first = thumbnail_cache_key(Path::new("D:/library-a/figure.jpg"));
+        let second = thumbnail_cache_key(Path::new("E:/library-b/figure.jpg"));
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            thumbnail_cache_key(Path::new("D:/library-a/figure.jpg"))
+        );
+    }
+
+    #[test]
+    fn thumbnail_path_stays_inside_cache_root() {
+        let cache = Path::new("C:/AppCache/thumbnails");
+        let thumbnail = thumbnail_path_for(Path::new("D:/library/figure.jpg"), cache);
+        assert!(thumbnail.starts_with(cache));
+        assert_eq!(
+            thumbnail.extension().and_then(|value| value.to_str()),
+            Some("jpg")
+        );
+    }
 }

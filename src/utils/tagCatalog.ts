@@ -55,6 +55,10 @@ export const GENERAL_TAG_GROUPS: readonly (readonly string[])[] = [
   [...ASPECT_RATIO_TAGS],
 ];
 
+export const BUILTIN_TAG_CATEGORIES = TAG_CATEGORIES;
+export const BUILTIN_TAGS = new Set<string>(TAG_CATEGORIES.flatMap(category => category.tags));
+export const isBuiltinTag = (tag: string): boolean => BUILTIN_TAGS.has(tag);
+
 export const matchesBranchTags = (
   itemTags: string[],
   includeTags: string[],
@@ -63,6 +67,12 @@ export const matchesBranchTags = (
 ): boolean => {
   if (excludeTags && excludeTags.some(tag => itemTags.includes(tag))) return false;
   if (!includeTags || includeTags.length === 0) return true;
+
+  const allKnownGroupTags = new Set(categoryGroups.flatMap(group => group));
+  const customInclude = includeTags.filter(tag => !allKnownGroupTags.has(tag) && !CONTENT_TAGS.includes(tag as any));
+  if (customInclude.length > 0 && !customInclude.every(tag => itemTags.includes(tag))) {
+    return false;
+  }
 
   const relevantInclude = includeTags.filter(tag => categoryGroups.some(group => group.includes(tag)));
   if (relevantInclude.length === 0) return true;
@@ -110,3 +120,49 @@ export const compactAspectRatioLabel = (tag: string) => (
     ? compactVisualTagLabel(tag)
     : tag
 );
+
+export const formatDurationLabel = (seconds?: number): string => {
+  if (!seconds || seconds <= 0) return '不限时';
+  if (seconds < 60) return `${seconds}秒`;
+  const mins = Math.floor(seconds / 60);
+  const remSec = seconds % 60;
+  if (remSec === 0) return `${mins}分钟`;
+  return `${mins}分${remSec}秒`;
+};
+
+export const getSetDetailText = (config: {
+  sessionType?: 'single' | 'progressive';
+  singleTimeSec?: number;
+  imageCount?: number;
+  progressiveStages?: Array<{ durationSec: number; count: number }>;
+}): string => {
+  if (config.sessionType === 'single') {
+    const timeText = config.singleTimeSec ? `${formatDurationLabel(config.singleTimeSec)}/张` : '不限时';
+    const countText = config.imageCount === 999 ? '全部图片' : `${config.imageCount || 0} 张`;
+    return `${timeText} · ${countText}`;
+  }
+
+  const stages = config.progressiveStages || [];
+  if (stages.length === 0) {
+    return '0 个阶段';
+  }
+
+  const durations = stages.map(s => s.durationSec).filter(d => typeof d === 'number' && d > 0);
+  const totalCount = stages.reduce((acc, s) => acc + (s.count || 0), 0);
+
+  let durationText = '';
+  if (durations.length > 0) {
+    const minSec = Math.min(...durations);
+    const maxSec = Math.max(...durations);
+    if (minSec === maxSec) {
+      durationText = `${formatDurationLabel(minSec)}/张`;
+    } else {
+      durationText = `${formatDurationLabel(minSec)}-${formatDurationLabel(maxSec)}/张`;
+    }
+  }
+
+  const stageCountText = `${stages.length} 个阶段`;
+  const countText = totalCount > 0 ? `共 ${totalCount} 张` : '';
+
+  return [durationText, stageCountText, countText].filter(Boolean).join(' · ');
+};

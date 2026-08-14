@@ -2,6 +2,7 @@
 # 依赖与包管理器 (Dependencies)
 # ==========================================
 node_modules/
+**/node_modules/
 .pnpm-store/
 package-lock.json.bak
 
@@ -21,6 +22,7 @@ __pycache__/
 # 构建输出与分发包 (Build Outputs & Release)
 # ==========================================
 dist/
+**/dist/
 dist-ssr/
 build/
 out/
@@ -28,7 +30,9 @@ release/
 server.js
 
 # Tauri / Rust 构建产物
-src-tauri/target/
+target/
+**/target/
+**/temp_payload/
 *.pdb
 
 # ==========================================

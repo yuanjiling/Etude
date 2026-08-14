@@ -11,7 +11,10 @@
     "lint": "tsc --noEmit",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "build:installer": "powershell -ExecutionPolicy Bypass -File scripts/build-installer.ps1",
+    "dev:installer": "npm --prefix installer run dev",
+    "tauri:dev:installer": "npm --prefix installer run tauri:dev"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",

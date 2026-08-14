@@ -10,6 +10,12 @@ export interface PracticeShortcuts {
   exitPractice: string;
 }
 
+export interface CustomTagGroup {
+  id: string;
+  name: string;
+  tags: string[];
+}
+
 export interface AppSettings {
   settingsVersion: number;
   theme: 'system' | 'light' | 'dark';
@@ -33,6 +39,8 @@ export interface AppSettings {
   rememberWindowBounds: boolean;
   windowBounds?: { x: number; y: number; width: number; height: number };
   shortcuts: PracticeShortcuts;
+  customTagGroups: CustomTagGroup[];
+  customTags: string[];
 }
 
 export type BodyPartTag = '手' | '足' | '臂' | '腿' | '躯干' | '头部面部' | '骨盆臀部';
