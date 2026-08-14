@@ -1,0 +1,55 @@
+@import "tailwindcss";
+@variant dark (&:where(.dark, .dark *));
+
+html, body, #root {
+  background-color: transparent !important;
+}
+
+#root {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+:where(#root *) {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+:where(#root) :where(input:not([type='range']), textarea, [contenteditable='true'], .select-text) {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+:where(#root img) {
+  -webkit-user-drag: none;
+}
+
+.thumbnail-size-slider {
+  height: 16px;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.thumbnail-size-slider::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 28%, transparent);
+}
+
+.thumbnail-size-slider::-webkit-slider-thumb {
+  width: 13px;
+  height: 13px;
+  margin-top: -5px;
+  appearance: none;
+  border: 1px solid color-mix(in srgb, currentColor 24%, transparent);
+  border-radius: 999px;
+  background: #fafaf9;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 18%);
+}
+
+.dark .thumbnail-size-slider::-webkit-slider-thumb {
+  background: #e4e4e7;
+}

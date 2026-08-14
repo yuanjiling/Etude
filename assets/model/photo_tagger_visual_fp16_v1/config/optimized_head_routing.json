@@ -1,0 +1,14 @@
+{
+  "content_scope": "structured",
+  "primary_body_part": "linear",
+  "people": "structured",
+  "gender_single": "linear",
+  "gender_multi": "structured",
+  "clothing": "linear",
+  "framing": "structured",
+  "pose_base": "structured",
+  "action_level": "linear",
+  "handheld_prop": "linear",
+  "perspective": "linear",
+  "view": "structured"
+}

@@ -1,0 +1,41 @@
+{
+  "format_version": 1,
+  "model_version": "photo-tagger-visual-fp16-v1",
+  "offline_only": true,
+  "network_required": false,
+  "vision_only": true,
+  "runtime": "onnxruntime-cpu",
+  "precision": "fp16",
+  "compact_multi": true,
+  "single_view_policy": {
+    "mode": "front_oblique_override",
+    "side_max": 0.8,
+    "front_min": 0.3,
+    "definition": "side is reserved for near-profile views; weak side with visible frontal evidence is decoded as front"
+  },
+  "assets": {
+    "onnx_model": "models/photo_tagger.nativefp16.onnx"
+  },
+  "multi_thresholds": {
+    "pose_base": [
+      0.475,
+      0.6,
+      0.55,
+      0.45,
+      0.875
+    ],
+    "view": [
+      0.375,
+      0.675,
+      0.6
+    ]
+  },
+  "requirements": {
+    "python": ">=3.10",
+    "packages": [
+      "onnxruntime",
+      "Pillow",
+      "numpy"
+    ]
+  }
+}

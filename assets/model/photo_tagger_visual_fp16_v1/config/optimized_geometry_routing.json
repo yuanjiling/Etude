@@ -1,0 +1,14 @@
+{
+  "pose_base": {
+    "pooled_logistic_weight": 0.0,
+    "spatial_ensemble_weight": 1.0
+  },
+  "perspective": {
+    "pooled_logistic_weight": 0.35,
+    "spatial_ensemble_weight": 0.65
+  },
+  "view": {
+    "pooled_logistic_weight": 0.2,
+    "spatial_ensemble_weight": 0.8
+  }
+}

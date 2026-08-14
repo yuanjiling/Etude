@@ -1,0 +1,294 @@
+import React, { useState, useEffect } from 'react';
+import { AppProvider, useAppContext } from './context/AppContext';
+import { ViewMode } from './types';
+import { PracticeView } from './views/PracticeView';
+import { LibraryView } from './views/LibraryView';
+import { SetsView } from './views/SetsView';
+import { HistoryView } from './views/HistoryView';
+import { PracticeWindow } from './views/PracticeWindow';
+import { SettingsView } from './views/SettingsView';
+import { Layout, Image as ImageIcon, Layers, Clock, Settings, Moon, Sun, Pin, Minus, X } from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { PhysicalPosition, PhysicalSize } from '@tauri-apps/api/dpi';
+
+import { toggleAlwaysOnTop, setAlwaysOnTop, minimizeWindow, closeWindow, startDraggingWindow, startRightClickDrag, isTauriEnvironment } from './utils/tauriWindow';
+
+const BottomNav: React.FC<{ active: ViewMode; onNavigate: (v: ViewMode) => void }> = ({ active, onNavigate }) => {
+  const { darkMode, toggleDarkMode } = useAppContext();
+  
+  const navItems = [
+    { id: 'practice', icon: Layout, label: '首页' },
+    { id: 'library', icon: ImageIcon, label: '图库' },
+    { id: 'sets', icon: Layers, label: '配置' },
+  ] as const;
+
+  return (
+    <div className="w-full h-[44px] bg-stone-50/80 dark:bg-zinc-900/80 backdrop-blur-3xl border-t border-black/5 dark:border-white/10 flex items-center justify-between px-3 z-40 shrink-0 select-none">
+      <div className="flex items-center gap-0.5">
+        {navItems.map((item) => (
+          <div key={item.id} className="relative">
+            {active === item.id && (
+              <motion.div
+                layoutId="activeNavIndicator"
+                className="absolute inset-0 bg-black/5 dark:bg-white/10 rounded-lg"
+                transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
+              />
+            )}
+            <button
+              onClick={() => onNavigate(item.id)}
+              className={`relative z-10 flex items-center gap-1 transition-all duration-300 active:scale-95 px-2.5 h-8 justify-center rounded-lg ${
+                active === item.id 
+                  ? 'text-black dark:text-white font-bold' 
+                  : 'text-stone-500 hover:text-black/70 dark:hover:text-white/70 hover:bg-black/5 dark:hover:bg-white/5'
+              }`}
+              title={item.label}
+            >
+              <item.icon size={15} strokeWidth={active === item.id ? 2.5 : 2} />
+              {active === item.id && <span className="text-[11px] font-medium">{item.label}</span>}
+            </button>
+          </div>
+        ))}
+      </div>
+      
+      <div className="flex items-center gap-0.5">
+        <button
+          onClick={() => onNavigate('settings')}
+          className={`flex items-center justify-center transition-all duration-300 active:scale-95 w-8 h-8 rounded-lg ${
+            active === 'settings' 
+              ? 'text-black dark:text-white bg-black/5 dark:bg-white/10' 
+              : 'text-stone-500 hover:text-black/70 dark:hover:text-white/70 hover:bg-black/5 dark:hover:bg-white/5'
+          }`}
+          title="设置"
+        >
+          <Settings size={15} strokeWidth={active === 'settings' ? 2.5 : 2} />
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const ControlBar = () => {
+  const { settings } = useAppContext();
+  const [isPinned, setIsPinned] = useState(false);
+
+  useEffect(() => {
+    let disposed = false;
+    setAlwaysOnTop(settings.startAlwaysOnTop).then(() => {
+      if (!disposed) setIsPinned(settings.startAlwaysOnTop);
+    });
+    return () => { disposed = true; };
+  }, [settings.startAlwaysOnTop]);
+
+  const handlePin = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const next = await toggleAlwaysOnTop(isPinned);
+    setIsPinned(next);
+  };
+
+  const handleMinimize = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    await minimizeWindow();
+  };
+
+  const handleClose = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    await closeWindow();
+  };
+
+  return (
+    <div className="flex items-center gap-0.5 bg-stone-200/50 dark:bg-zinc-800/60 backdrop-blur-md px-1 py-0.5 rounded-full border border-black/5 dark:border-white/10 pointer-events-auto">
+      <button 
+        onClick={handlePin}
+        className={`flex items-center justify-center w-6 h-6 rounded-full transition-all duration-300 active:scale-90 ${
+          isPinned 
+            ? 'bg-amber-500 text-white font-bold' 
+            : 'text-stone-500 hover:text-black dark:text-zinc-400 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/10'
+        }`} 
+        title={isPinned ? "取消置顶" : "置顶窗口"}
+      >
+        <Pin size={11} className={isPinned ? "fill-current" : ""} />
+      </button>
+      <button 
+        onClick={handleMinimize}
+        className="flex items-center justify-center w-6 h-6 rounded-full text-stone-500 hover:text-black dark:text-zinc-400 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/10 transition-all duration-300 active:scale-90" 
+        title="最小化窗口"
+      >
+        <Minus size={11} />
+      </button>
+      <button 
+        onClick={handleClose}
+        className="flex items-center justify-center w-6 h-6 rounded-full text-stone-500 hover:text-red-500 dark:text-zinc-400 dark:hover:text-red-400 hover:bg-red-500/10 transition-all duration-300 active:scale-90" 
+        title="关闭窗口"
+      >
+        <X size={11} />
+      </button>
+    </div>
+  );
+};
+
+const MainContent = () => {
+  const { settings, darkMode, updateSettings } = useAppContext();
+  const [currentView, setCurrentView] = useState<ViewMode>('practice');
+  const [practiceConfig, setPracticeConfig] = useState<any>(null);
+
+  const startPractice = (config: any) => {
+    setPracticeConfig(config);
+    setCurrentView('active_practice');
+  };
+
+  const endPractice = () => {
+    setPracticeConfig(null);
+    setCurrentView('practice');
+  };
+
+  useEffect(() => {
+    if (!isTauriEnvironment() || !settings.rememberWindowBounds) return;
+    const appWindow = getCurrentWindow();
+    let disposed = false;
+    let saveTimer: number | undefined;
+    const restore = async () => {
+      if (settings.windowBounds) {
+        const { x, y, width, height } = settings.windowBounds;
+        const hasUsablePosition = Number.isFinite(x) && Number.isFinite(y) && x > -30000 && y > -30000;
+        if (hasUsablePosition) {
+          await appWindow.setPosition(new PhysicalPosition(x, y));
+        }
+        await appWindow.setSize(new PhysicalSize(Math.max(320, width), Math.max(480, height)));
+      }
+    };
+    const saveBounds = () => {
+      window.clearTimeout(saveTimer);
+      saveTimer = window.setTimeout(async () => {
+        if (disposed) return;
+        if (await appWindow.isMinimized()) return;
+        const [position, size] = await Promise.all([appWindow.outerPosition(), appWindow.outerSize()]);
+        if (position.x <= -30000 || position.y <= -30000 || size.width < 320 || size.height < 480) return;
+        updateSettings({ windowBounds: { x: position.x, y: position.y, width: size.width, height: size.height } });
+      }, 250);
+    };
+    restore().catch(console.warn);
+    const listeners = Promise.all([appWindow.onMoved(saveBounds), appWindow.onResized(saveBounds)]);
+    return () => {
+      disposed = true;
+      window.clearTimeout(saveTimer);
+      listeners.then(unlisteners => unlisteners.forEach(unlisten => unlisten())).catch(console.warn);
+    };
+  }, [settings.rememberWindowBounds]);
+
+  if (currentView === 'active_practice') {
+    return <PracticeWindow config={practiceConfig} onExit={endPractice} />;
+  }
+
+  const isDesktop = isTauriEnvironment();
+  const bgOpacityHex = Math.round((settings.bgOpacity / 100) * 255).toString(16).padStart(2, '0');
+  const bgColor = darkMode ? `#18181b${bgOpacityHex}` : `#fafaf9${bgOpacityHex}`;
+
+  return (
+    <div className={`flex justify-center items-center w-screen h-screen ${isDesktop ? 'p-0 bg-transparent' : 'pl-16 bg-stone-100 dark:bg-zinc-950'} text-stone-800 dark:text-zinc-100 overflow-hidden font-sans selection:bg-black/10 dark:selection:bg-white/20 relative`}>
+      {/* Global Film Grain Noise Overlay */}
+      <div className="absolute inset-0 pointer-events-none opacity-[0.04] dark:opacity-[0.06] mix-blend-overlay z-[100]" style={{
+        backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E")`
+      }} />
+      <main className={`group ${isDesktop ? 'w-full h-full' : 'w-[600px] h-[900px]'} rounded-lg border border-black/5 dark:border-white/5 backdrop-blur-3xl overflow-hidden flex flex-col relative transition-colors duration-300`} style={{ backgroundColor: bgColor }}>
+        
+        {/* Navigation Header with window dragging & controls */}
+        <div className="w-full h-9 px-3 flex items-center justify-between shrink-0 select-none bg-stone-100/50 dark:bg-zinc-900/50 border-b border-black/5 dark:border-white/5 z-40">
+          <div data-tauri-drag-region className="flex-1 h-full cursor-default flex items-center text-[11px] font-semibold tracking-wider text-stone-500 dark:text-zinc-400">
+          </div>
+          <ControlBar />
+        </div>
+
+        {/* Animated Lunar Eclipse Window Background */}
+        <div className="absolute inset-0 z-0 overflow-hidden pointer-events-none rounded-lg">
+          <motion.div
+            className="absolute -top-[200px] -right-[200px] w-[800px] h-[800px] bg-white/40 dark:bg-white/5 rounded-full blur-[60px]"
+            style={{
+              '--shadow-x': '-50%',
+              WebkitMaskImage: 'radial-gradient(circle 450px at var(--shadow-x) 50%, transparent 0%, transparent 75%, black 100%)',
+              maskImage: 'radial-gradient(circle 450px at var(--shadow-x) 50%, transparent 0%, transparent 75%, black 100%)'
+            } as any}
+            animate={{
+              '--shadow-x': ['-50%', '150%']
+            }}
+            transition={{ duration: 25, repeat: Infinity, repeatType: 'reverse', ease: 'easeInOut' }}
+          />
+        </div>
+
+        <div className="flex-1 relative z-10 bg-transparent overflow-hidden">
+          <div className="relative w-full h-full flex">
+          <AnimatePresence initial={false}>
+            <motion.div
+              key={currentView}
+              initial={{ opacity: 0, y: 8, filter: 'blur(4px)' }}
+              animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
+              exit={{ opacity: 0, y: -8, filter: 'blur(4px)' }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
+              className="absolute inset-0 flex flex-col w-full min-h-full overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
+            >
+              {currentView === 'practice' && <PracticeView onStart={startPractice} />}
+              {currentView === 'library' && <LibraryView onStart={startPractice} />}
+              {currentView === 'sets' && <SetsView onStart={startPractice} />}
+              {currentView === 'settings' && <SettingsView />}
+            </motion.div>
+          </AnimatePresence>
+        </div>
+        </div>
+        <BottomNav active={currentView} onNavigate={setCurrentView} />
+      </main>
+    </div>
+  );
+};
+
+export default function App() {
+  // Global event listeners for disabling web context menu and enabling right-click drag
+  useEffect(() => {
+    const handleContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
+    };
+
+    let startX = 0;
+    let startY = 0;
+
+    const handleMouseDown = (e: MouseEvent) => {
+      // e.button === 2 indicates the secondary (right) mouse button
+      if (e.button === 2) {
+        // Do not right-click drag if clicking on the top title bar (which has left-click drag)
+        const target = e.target as HTMLElement | null;
+        if (target?.closest('[data-tauri-drag-region]')) {
+          return;
+        }
+        
+        startX = e.screenX;
+        startY = e.screenY;
+        startRightClickDrag(e);
+      }
+    };
+    
+    const handleMouseUp = (e: MouseEvent) => {
+      if (e.button === 2) {
+        const delta = Math.hypot(e.screenX - startX, e.screenY - startY);
+        if (delta < 3) {
+          // This was a click, not a drag. Trigger custom context menu.
+          window.dispatchEvent(new CustomEvent('app-context-menu', { detail: { x: e.clientX, y: e.clientY } }));
+        }
+      }
+    };
+
+    window.addEventListener('contextmenu', handleContextMenu);
+    window.addEventListener('mousedown', handleMouseDown);
+    window.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      window.removeEventListener('contextmenu', handleContextMenu);
+      window.removeEventListener('mousedown', handleMouseDown);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, []);
+
+  return (
+    <AppProvider>
+      <MainContent />
+    </AppProvider>
+  );
+}
