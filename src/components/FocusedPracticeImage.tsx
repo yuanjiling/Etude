@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { motion } from 'motion/react';
 import type { FocusRegion, ImageRecord } from '../types';
+import { getFocusFrame } from '../utils/focusRegion';
 
 type Size = { width: number; height: number };
 
@@ -13,8 +14,10 @@ export const FocusedPracticeImage: React.FC<{
   src?: string;
   quickFade?: boolean;
   animateFlip?: boolean;
+  loading?: 'eager' | 'lazy';
+  onNaturalSize?: (size: Size) => void;
   onImageError?: () => void;
-}> = ({ image, region, flipped, grayscale, active = true, src, quickFade = false, animateFlip = true, onImageError }) => {
+}> = ({ image, region, flipped, grayscale, active = true, src, quickFade = false, animateFlip = true, loading = 'eager', onNaturalSize, onImageError }) => {
   const frameRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const [frame, setFrame] = useState<Size>({ width: 0, height: 0 });
@@ -47,7 +50,9 @@ export const FocusedPracticeImage: React.FC<{
 
   const acceptLoadedImage = (element: HTMLImageElement) => {
     if (element.naturalWidth <= 0 || element.naturalHeight <= 0) return;
-    setNatural({ width: element.naturalWidth, height: element.naturalHeight });
+    const size = { width: element.naturalWidth, height: element.naturalHeight };
+    setNatural(size);
+    onNaturalSize?.(size);
     reveal();
   };
 
@@ -75,20 +80,12 @@ export const FocusedPracticeImage: React.FC<{
 
   const transform = useMemo(() => {
     if (!region || !frame.width || !frame.height || !natural.width || !natural.height) return null;
-    let regionWidth = region.width * natural.width;
-    let regionHeight = region.height * natural.height;
-    if (region.tag === '手' || region.tag === '足') {
-      const aspect = regionWidth / regionHeight;
-      if (aspect < 0.65) regionWidth = regionHeight * 0.65;
-      if (aspect > 1.5) regionHeight = regionWidth / 1.5;
-    }
-    const scale = Math.min(frame.width / regionWidth, frame.height / regionHeight);
-    const centerX = (region.x + region.width / 2) * natural.width;
-    const centerY = (region.y + region.height / 2) * natural.height;
+    const focusFrame = getFocusFrame(region, natural.width, natural.height);
+    const scale = Math.min(frame.width / focusFrame.width, frame.height / focusFrame.height);
     const translateX = flipped
-      ? frame.width / 2 + scale * centerX
-      : frame.width / 2 - scale * centerX;
-    const translateY = frame.height / 2 - scale * centerY;
+      ? frame.width / 2 + scale * focusFrame.centerX
+      : frame.width / 2 - scale * focusFrame.centerX;
+    const translateY = frame.height / 2 - scale * focusFrame.centerY;
     return `matrix(${flipped ? -scale : scale}, 0, 0, ${scale}, ${translateX}, ${translateY})`;
   }, [flipped, frame, natural, region]);
 
@@ -109,7 +106,7 @@ export const FocusedPracticeImage: React.FC<{
           ref={imageRef}
           src={imageSrc}
           alt={image.fileName || ''}
-          loading="eager"
+          loading={loading}
           decoding="async"
           onLoad={event => acceptLoadedImage(event.currentTarget)}
           onError={onImageError}

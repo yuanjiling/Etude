@@ -3,6 +3,7 @@ import { motion } from 'motion/react';
 import { X, Play } from 'lucide-react';
 import type { ImageRecord, FocusRegion } from '../types';
 import { FocusedPracticeImage } from './FocusedPracticeImage';
+import { useNearViewport } from '../hooks/useNearViewport';
 import { setPracticeLocked, isTauriEnvironment } from '../utils/tauriWindow';
 
 interface PracticeReviewProps {
@@ -23,21 +24,24 @@ const ReviewImageCard = memo<{
   item: { image: ImageRecord; focusRegion?: FocusRegion };
   onContinue: () => void;
 }>(({ item, onContinue }) => {
-  const displaySrc = item.image.thumbnail || item.image.previewUrl || item.image.url;
+  const { ref, isNear } = useNearViewport<HTMLDivElement>('500px 0px');
+  const displaySrc = item.image.thumbnailUrl || item.image.url;
 
   return (
-    <div 
+    <div
+      ref={ref}
       className="group/rcard relative aspect-[3/4] bg-zinc-900 rounded-xl overflow-hidden cursor-pointer border border-white/5 hover:border-white/20 transition-all hover:scale-[1.02] active:scale-95"
       onClick={onContinue}
     >
-      {item.focusRegion ? (
+      {isNear && (item.focusRegion ? (
         <FocusedPracticeImage 
           image={item.image} 
           region={item.focusRegion} 
           src={displaySrc}
           flipped={false} 
           grayscale={false} 
-          quickFade 
+          quickFade
+          loading="lazy"
         />
       ) : (
         <img
@@ -47,7 +51,7 @@ const ReviewImageCard = memo<{
           className="w-full h-full object-cover transition-transform duration-300 group-hover/rcard:scale-105 opacity-90 group-hover/rcard:opacity-100"
           alt=""
         />
-      )}
+      ))}
       <div className="absolute inset-0 bg-black/0 group-hover/rcard:bg-black/20 transition-colors flex items-center justify-center opacity-0 group-hover/rcard:opacity-100">
         <div className="w-8 h-8 rounded-full bg-white/90 text-black flex items-center justify-center shadow-lg">
           <Play size={14} className="fill-current translate-x-0.5" />

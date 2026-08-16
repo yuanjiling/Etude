@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Play, Pause, ChevronRight, ChevronLeft, X, TimerReset, Check, Lock, Unlock, Snowflake, Focus } from 'lucide-react';
 import { CircularTimer } from '../components/CircularTimer';
@@ -16,7 +16,7 @@ import {
   matchesBranchTags,
   FILTER_TAG_GROUPS,
 } from '../utils/tagCatalog';
-import { getVirtualFocusTags } from '../utils/focusRegion';
+import { getFocusFrame, getVirtualFocusTags } from '../utils/focusRegion';
 import { folderContains, folderDisplayName } from '../utils/libraryFolders';
 import { samplePracticePool } from '../utils/practiceSampling';
 import { playTickSound, playFinishSound } from '../utils/sound';
@@ -156,6 +156,7 @@ export const PracticeWindow: React.FC<{
   const canvasViewRef = useRef(canvasView);
   const canvasSurfaceRef = useRef<HTMLDivElement>(null);
   const [surfaceSize, setSurfaceSize] = useState({ width: 0, height: 0 });
+  const [naturalImageSize, setNaturalImageSize] = useState<{ imageId: string; width: number; height: number } | null>(null);
 
   useEffect(() => {
     const surface = canvasSurfaceRef.current;
@@ -173,12 +174,18 @@ export const PracticeWindow: React.FC<{
     originX: number;
     originY: number;
   } | null>(null);
+  const [isFlipped, setIsFlipped] = useState(settings.defaultFlip);
+  const [isGrayscale, setIsGrayscale] = useState(settings.defaultGrayscale);
+  const [isGridEnabled, setIsGridEnabled] = useState(settings.defaultGrid);
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
+
   const [originalReviewState, setOriginalReviewState] = useState<{ items: { image: any; focusRegion?: any }[]; totalElapsedSec: number } | null>(null);
   
   // Real time tracking
   const sessionStartTimeRef = useRef(0);
   const totalPausedTimeRef = useRef(0);
   const lastPauseTimeRef = useRef(0);
+  const isFinishingRef = useRef(false);
   const shortcutActionRef = useRef<(action: PracticeShortcutAction) => void>(() => undefined);
   const [reviewState, setReviewState] = useState<{ items: { image: ImageRecord; focusRegion?: FocusRegion }[], totalElapsedSec: number } | null>(null);
 
@@ -188,26 +195,37 @@ export const PracticeWindow: React.FC<{
   const gridGeometry = useMemo(() => {
     const image = currentItem?.image;
     if (!image || surfaceSize.width <= 0 || surfaceSize.height <= 0) return null;
-    const naturalWidth = image.pixelWidth || 1;
-    const naturalHeight = image.pixelHeight || 1;
-    const containScale = Math.min(surfaceSize.width / naturalWidth, surfaceSize.height / naturalHeight);
-    const width = naturalWidth * containScale;
-    const height = naturalHeight * containScale;
-    const display = { left: (surfaceSize.width - width) / 2, top: (surfaceSize.height - height) / 2, width, height };
+    const naturalWidth = naturalImageSize?.imageId === image.id ? naturalImageSize.width : image.pixelWidth || 1;
+    const naturalHeight = naturalImageSize?.imageId === image.id ? naturalImageSize.height : image.pixelHeight || 1;
     const density = Math.max(1, settings.gridDensity || 3);
     const region = currentItem.focusRegion;
-    if (!region) {
-      return { ...display, cellWidth: width / density, cellHeight: height / density };
-    }
-    let regionWidth = region.width * width;
-    let regionHeight = region.height * height;
-    if (region.tag === '手' || region.tag === '足') {
-      const aspect = regionWidth / Math.max(regionHeight, 1);
-      if (aspect < 0.65) regionWidth = regionHeight * 0.65;
-      if (aspect > 1.5) regionHeight = regionWidth / 1.5;
-    }
-    return { ...display, cellWidth: regionWidth / density, cellHeight: regionHeight / density };
-  }, [surfaceSize, currentItem?.image?.id, currentItem?.focusRegion?.id, settings.gridDensity]);
+    const containScale = Math.min(surfaceSize.width / naturalWidth, surfaceSize.height / naturalHeight);
+    const renderedWidth = naturalWidth * containScale;
+    const renderedHeight = naturalHeight * containScale;
+    const imageLeft = (surfaceSize.width - renderedWidth) / 2;
+    const imageTop = (surfaceSize.height - renderedHeight) / 2;
+    const focusFrame = region ? getFocusFrame(region, naturalWidth, naturalHeight) : null;
+    const baseCellWidth = (focusFrame ? focusFrame.width * containScale : renderedWidth) / density;
+    const baseCellHeight = (focusFrame ? focusFrame.height * containScale : renderedHeight) / density;
+    const focusLeft = focusFrame
+      ? (isFlipped
+        ? (naturalWidth - focusFrame.centerX - focusFrame.width / 2) * containScale
+        : (focusFrame.centerX - focusFrame.width / 2) * containScale)
+      : 0;
+    const focusTop = focusFrame ? (focusFrame.centerY - focusFrame.height / 2) * containScale : 0;
+    const positiveModulo = (value: number, divisor: number) => ((value % divisor) + divisor) % divisor;
+
+    return {
+      left: canvasView.x + canvasView.scale * imageLeft,
+      top: canvasView.y + canvasView.scale * imageTop,
+      width: renderedWidth * canvasView.scale,
+      height: renderedHeight * canvasView.scale,
+      cellWidth: baseCellWidth * canvasView.scale,
+      cellHeight: baseCellHeight * canvasView.scale,
+      offsetX: positiveModulo(focusLeft, baseCellWidth) * canvasView.scale,
+      offsetY: positiveModulo(focusTop, baseCellHeight) * canvasView.scale,
+    };
+  }, [surfaceSize, naturalImageSize, currentItem?.image?.id, currentItem?.image?.pixelWidth, currentItem?.image?.pixelHeight, currentItem?.focusRegion, canvasView, isFlipped, settings.gridDensity]);
 
   const updateCanvasView = (next: { x: number; y: number; scale: number }) => {
     canvasViewRef.current = next;
@@ -218,28 +236,23 @@ export const PracticeWindow: React.FC<{
     const surface = canvasSurfaceRef.current;
     const viewportWidth = surface?.clientWidth ?? surfaceSize.width;
     const viewportHeight = surface?.clientHeight ?? surfaceSize.height;
-    const naturalWidth = image.pixelWidth || 1;
-    const naturalHeight = image.pixelHeight || 1;
+    const naturalWidth = naturalImageSize?.imageId === image.id ? naturalImageSize.width : image.pixelWidth || 1;
+    const naturalHeight = naturalImageSize?.imageId === image.id ? naturalImageSize.height : image.pixelHeight || 1;
     if (!viewportWidth || !viewportHeight) return { x: 0, y: 0, scale: 1 };
     const containScale = Math.min(viewportWidth / naturalWidth, viewportHeight / naturalHeight);
     const displayedWidth = naturalWidth * containScale;
     const displayedHeight = naturalHeight * containScale;
     const left = (viewportWidth - displayedWidth) / 2;
     const top = (viewportHeight - displayedHeight) / 2;
-    let regionWidth = region.width * displayedWidth;
-    let regionHeight = region.height * displayedHeight;
-    if (region.tag === '手' || region.tag === '足') {
-      const aspect = regionWidth / Math.max(regionHeight, 1);
-      if (aspect < 0.65) regionWidth = regionHeight * 0.65;
-      if (aspect > 1.5) regionHeight = regionWidth / 1.5;
-    }
-    const normalizedCenterX = region.x + region.width / 2;
+    const focusFrame = getFocusFrame(region, naturalWidth, naturalHeight);
+    const regionWidth = focusFrame.width * containScale;
+    const regionHeight = focusFrame.height * containScale;
     const centerX = flipped
-      ? viewportWidth - (left + normalizedCenterX * displayedWidth)
-      : left + normalizedCenterX * displayedWidth;
-    const centerY = top + (region.y + region.height / 2) * displayedHeight;
+      ? viewportWidth - (left + focusFrame.centerX * containScale)
+      : left + focusFrame.centerX * containScale;
+    const centerY = top + focusFrame.centerY * containScale;
     const fitScale = Math.min(viewportWidth / Math.max(regionWidth, 1), viewportHeight / Math.max(regionHeight, 1));
-    const scale = Math.max(1, Math.min(8, fitScale * 0.5));
+    const scale = Math.max(1, fitScale);
     return {
       x: viewportWidth / 2 - scale * centerX,
       y: viewportHeight / 2 - scale * centerY,
@@ -261,7 +274,7 @@ export const PracticeWindow: React.FC<{
     const pointerX = event.clientX - bounds.left;
     const pointerY = event.clientY - bounds.top;
     const current = canvasViewRef.current;
-    const nextScale = Math.min(8, Math.max(0.2, current.scale * Math.exp(-event.deltaY * 0.0015)));
+    const nextScale = Math.min(64, Math.max(0.2, current.scale * Math.exp(-event.deltaY * 0.0015)));
     if (nextScale === current.scale) return;
     const ratio = nextScale / current.scale;
     updateCanvasView({
@@ -411,7 +424,12 @@ export const PracticeWindow: React.FC<{
 
       if (cancelled) return;
       setPlaylist(newPlaylist);
-      if (newPlaylist.length > 0) setTimeLeft(newPlaylist[0].durationSec);
+      if (newPlaylist.length > 0) {
+        setTimeLeft(newPlaylist[0].durationSec);
+        if (prepSec === 0 && sessionStartTimeRef.current === 0) {
+          sessionStartTimeRef.current = Date.now();
+        }
+      }
     };
 
     build()
@@ -426,14 +444,14 @@ export const PracticeWindow: React.FC<{
     };
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     canvasDragRef.current = null;
     setIsDraggingCanvas(false);
     if (currentItem?.image) {
-      applyFraming(currentItem.image, currentItem.focusRegion, settings.defaultFlip);
+      applyFraming(currentItem.image, currentItem.focusRegion, isFlipped);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentIndex, currentItem?.image?.id, currentItem?.focusRegion?.id, surfaceSize]);
+  }, [currentIndex, currentItem?.image?.id, currentItem?.focusRegion?.id, surfaceSize, naturalImageSize, isFlipped]);
 
   // Timer logic
   useEffect(() => {
@@ -565,18 +583,12 @@ export const PracticeWindow: React.FC<{
     };
   }, []);
 
-  const [isFlipped, setIsFlipped] = useState(settings.defaultFlip);
-  const [isGrayscale, setIsGrayscale] = useState(settings.defaultGrayscale);
-  const [isGridEnabled, setIsGridEnabled] = useState(settings.defaultGrid);
-
   useEffect(() => {
     setIsFlipped(settings.defaultFlip);
     setIsGrayscale(settings.defaultGrayscale);
     setIsGridEnabled(settings.defaultGrid);
   }, [currentIndex, settings]);
 
-  // In-component context menu state
-  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const MENU_W = 140;
   const MENU_H = 148;
 
@@ -627,6 +639,8 @@ export const PracticeWindow: React.FC<{
       return;
     }
 
+    if (isFinishingRef.current) return;
+
     const len = finalLength !== undefined ? finalLength : playlist.length;
     if (len === 0) {
       onExit();
@@ -639,7 +653,10 @@ export const PracticeWindow: React.FC<{
       lastPauseTimeRef.current = 0;
     }
     
-    const realElapsedSec = Math.floor((Date.now() - sessionStartTimeRef.current - totalPausedTimeRef.current) / 1000);
+    isFinishingRef.current = true;
+    const finishedAt = Date.now();
+    const startedAt = sessionStartTimeRef.current || finishedAt;
+    const realElapsedSec = Math.floor((finishedAt - startedAt - totalPausedTimeRef.current) / 1000);
     
     const imagesToSave = [];
     const itemsToSave = [];
@@ -648,14 +665,14 @@ export const PracticeWindow: React.FC<{
       itemsToSave.push({ image: playlist[i].image, focusRegion: playlist[i].focusRegion });
     }
     
-    addHistory({
-      id: Date.now().toString(),
-      date: Date.now(),
+    const historyRecord = {
+      id: finishedAt.toString(),
+      date: finishedAt,
       durationSec: Math.max(0, realElapsedSec),
       imageCount: len,
       images: imagesToSave,
       items: itemsToSave,
-    });
+    };
     
     // 进入练习回顾界面时，必须立即解除点击穿透锁定，恢复正常的鼠标点击交互
     if (isClickThroughRef.current) {
@@ -668,6 +685,11 @@ export const PracticeWindow: React.FC<{
     
     // Show review screen
     setReviewState({ items: itemsToSave, totalElapsedSec: Math.max(0, realElapsedSec) });
+
+    // 先让回顾层完成一帧绘制，再更新整套图库计数并写入历史。
+    requestAnimationFrame(() => {
+      window.setTimeout(() => addHistory(historyRecord), 0);
+    });
   };
 
   if (isBuildingPlaylist) {
@@ -742,38 +764,32 @@ export const PracticeWindow: React.FC<{
               flipped={isFlipped}
               grayscale={isGrayscale}
               animateFlip={settings.flipAnimation}
+              onNaturalSize={({ width, height }) => {
+                setNaturalImageSize(current => (
+                  current?.imageId === currentItem.image.id && current.width === width && current.height === height
+                    ? current
+                    : { imageId: currentItem.image.id, width, height }
+                ));
+              }}
             />
           </AnimatePresence>
-
-          {isGridEnabled && currentItem.focusRegion && gridGeometry && (
-            <div
-              className="absolute pointer-events-none mix-blend-difference"
-              style={{
-                left: gridGeometry.left,
-                top: gridGeometry.top,
-                width: gridGeometry.width,
-                height: gridGeometry.height,
-                opacity: settings.gridOpacity / 100,
-                transform: isFlipped ? 'scaleX(-1)' : undefined,
-                transformOrigin: 'center center',
-                backgroundImage: `linear-gradient(to right, ${settings.gridColor} ${settings.gridLineWidth}px, transparent ${settings.gridLineWidth}px), linear-gradient(to bottom, ${settings.gridColor} ${settings.gridLineWidth}px, transparent ${settings.gridLineWidth}px)`,
-                backgroundSize: `${gridGeometry.cellWidth}px ${gridGeometry.cellHeight}px`,
-                backgroundPosition: '0 0',
-              }}
-            />
-          )}
-          {isGridEnabled && !currentItem.focusRegion && (
-            <div 
-              className="absolute inset-0 pointer-events-none mix-blend-difference" 
-              style={{
-                opacity: settings.gridOpacity / 100,
-                backgroundImage: `linear-gradient(to right, ${settings.gridColor} ${settings.gridLineWidth}px, transparent ${settings.gridLineWidth}px), linear-gradient(to bottom, ${settings.gridColor} ${settings.gridLineWidth}px, transparent ${settings.gridLineWidth}px)`,
-                backgroundSize: `${100 / settings.gridDensity}% ${100 / settings.gridDensity}%`,
-                backgroundPosition: 'center center',
-              }}
-            />
-          )}
         </div>
+
+        {isGridEnabled && gridGeometry && (
+          <div
+            className="absolute pointer-events-none mix-blend-difference"
+            style={{
+              left: gridGeometry.left,
+              top: gridGeometry.top,
+              width: gridGeometry.width,
+              height: gridGeometry.height,
+              opacity: settings.gridOpacity / 100,
+              backgroundImage: `linear-gradient(to right, ${settings.gridColor} ${settings.gridLineWidth}px, transparent ${settings.gridLineWidth}px), linear-gradient(to bottom, ${settings.gridColor} ${settings.gridLineWidth}px, transparent ${settings.gridLineWidth}px)`,
+              backgroundSize: `${gridGeometry.cellWidth}px ${gridGeometry.cellHeight}px`,
+              backgroundPosition: `${gridGeometry.offsetX}px ${gridGeometry.offsetY}px`,
+            }}
+          />
+        )}
       </div>
 
       {/* Interactive Surface for Canvas Drag / Wheel / Double Click */}
