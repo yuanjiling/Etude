@@ -13,7 +13,8 @@ export const FocusedPracticeImage: React.FC<{
   src?: string;
   quickFade?: boolean;
   animateFlip?: boolean;
-}> = ({ image, region, flipped, grayscale, active = true, src, quickFade = false, animateFlip = true }) => {
+  onImageError?: () => void;
+}> = ({ image, region, flipped, grayscale, active = true, src, quickFade = false, animateFlip = true, onImageError }) => {
   const frameRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const [frame, setFrame] = useState<Size>({ width: 0, height: 0 });
@@ -111,6 +112,7 @@ export const FocusedPracticeImage: React.FC<{
           loading="eager"
           decoding="async"
           onLoad={event => acceptLoadedImage(event.currentTarget)}
+          onError={onImageError}
           className={`${region ? 'absolute left-0 top-0 max-w-none max-h-none' : 'w-full h-full object-contain'} will-change-[opacity,transform] ${loaded ? 'opacity-100' : 'opacity-0'}`}
           style={region && transform ? {
             width: natural.width,

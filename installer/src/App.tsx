@@ -10,12 +10,27 @@ import {
   ArrowRight,
 } from "lucide-react";
 
+interface InstallInfo {
+  default_path: string;
+  is_update: boolean;
+  existing_version: string | null;
+  current_version: string;
+}
+
 async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     return await invoke<T>(cmd, args);
   } catch (err) {
     console.warn(`[Browser Mock] invoke('${cmd}')`, args, err);
+    if (cmd === "get_install_info") {
+      return {
+        default_path: "C:\\Users\\User\\AppData\\Local\\Programs\\Etude",
+        is_update: false,
+        existing_version: null,
+        current_version: "1.1.0",
+      } as unknown as T;
+    }
     if (cmd === "get_default_install_path") {
       return "C:\\Users\\User\\AppData\\Local\\Programs\\Etude" as unknown as T;
     }
@@ -29,6 +44,9 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
 export default function App() {
   const [step, setStep] = useState<"ready" | "installing" | "finished" | "error">("ready");
   const [installPath, setInstallPath] = useState<string>("");
+  const [isUpdate, setIsUpdate] = useState<boolean>(false);
+  const [existingVersion, setExistingVersion] = useState<string | null>(null);
+  const [currentVersion, setCurrentVersion] = useState<string>("1.1.0");
   const [createDesktopShortcut, setCreateDesktopShortcut] = useState<boolean>(true);
   const [showPathInput, setShowPathInput] = useState<boolean>(false);
 
@@ -37,11 +55,23 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState<string>("");
 
   useEffect(() => {
-    tauriInvoke<string>("get_default_install_path")
-      .then((path) => {
-        if (path) setInstallPath(path);
+    tauriInvoke<InstallInfo>("get_install_info")
+      .then((info) => {
+        if (info) {
+          if (info.default_path) setInstallPath(info.default_path);
+          setIsUpdate(!!info.is_update);
+          setExistingVersion(info.existing_version || null);
+          if (info.current_version) setCurrentVersion(info.current_version);
+        }
       })
-      .catch(console.error);
+      .catch((err) => {
+        console.error("get_install_info failed, falling back to get_default_install_path", err);
+        tauriInvoke<string>("get_default_install_path")
+          .then((path) => {
+            if (path) setInstallPath(path);
+          })
+          .catch(console.error);
+      });
 
     // Disable WebView default context menu, text selection and drag selection
     const handleContextMenu = (e: MouseEvent) => {
@@ -187,9 +217,14 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <h1 className="text-sm font-bold text-stone-900 tracking-tight">画谱 · Etude</h1>
                   <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-stone-200/70 text-stone-600 font-mono">
-                    v0.1.2
+                    v{currentVersion}
                   </span>
                 </div>
+                {isUpdate && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-stone-200/50 text-stone-600 font-medium border border-black/5">
+                    {existingVersion ? `覆盖旧版本 v${existingVersion}` : "检测到已安装"}
+                  </span>
+                )}
               </div>
 
               {/* Main Action Button - Matching Etude's rounded-xl */}
@@ -197,7 +232,7 @@ export default function App() {
                 onClick={handleInstall}
                 className="w-full h-10 rounded-xl bg-stone-900 text-white font-medium text-xs flex items-center justify-center gap-2 hover:bg-stone-800 active:scale-[0.98] transition-all shadow-sm cursor-pointer"
               >
-                <span>开始安装</span>
+                <span>{isUpdate ? "开始更新" : "开始安装"}</span>
                 <ArrowRight className="w-3.5 h-3.5" />
               </button>
             </div>
@@ -208,7 +243,7 @@ export default function App() {
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-1 truncate max-w-[240px]" title={installPath}>
                     <Folder className="w-3 h-3 shrink-0 text-stone-400" />
-                    <span className="truncate">{installPath || "获取默认目录..."}</span>
+                    <span className="truncate">{installPath || (isUpdate ? "获取已安装目录..." : "获取默认目录...")}</span>
                   </div>
                   <button
                     onClick={() => setShowPathInput(true)}
@@ -254,7 +289,7 @@ export default function App() {
           <div className="flex flex-col items-center justify-center h-full gap-3 px-2">
             <div className="flex items-center gap-2 text-xs font-medium text-stone-700">
               <Loader2 className="w-3.5 h-3.5 animate-spin text-stone-500" />
-              <span>正在安装...</span>
+              <span>{isUpdate ? "正在更新..." : "正在安装..."}</span>
               <span className="font-mono text-stone-400 ml-1">{progress}%</span>
             </div>
 
@@ -274,7 +309,7 @@ export default function App() {
               <Check className="w-4 h-4" />
             </div>
 
-            <h2 className="text-xs font-bold text-stone-800">安装完成</h2>
+            <h2 className="text-xs font-bold text-stone-800">{isUpdate ? "更新完成" : "安装完成"}</h2>
 
             <div className="flex items-center gap-2 w-full max-w-[220px] mt-1">
               <button
@@ -299,7 +334,7 @@ export default function App() {
           <div className="flex flex-col items-center justify-center h-full gap-2 text-center px-2">
             <AlertCircle className="w-6 h-6 text-red-500" />
             <div className="flex flex-col gap-0.5">
-              <h2 className="text-xs font-bold text-stone-800">安装失败</h2>
+              <h2 className="text-xs font-bold text-stone-800">{isUpdate ? "更新失败" : "安装失败"}</h2>
               <p className="text-[10px] text-stone-400 font-mono max-w-[280px] truncate">{errorMessage}</p>
             </div>
             <div className="flex items-center gap-2 mt-1">

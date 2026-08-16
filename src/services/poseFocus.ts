@@ -45,6 +45,7 @@ const getLandmarker = () => {
 const loadImage = (src: string) => new Promise<HTMLImageElement>((resolve, reject) => {
   const image = new Image();
   image.crossOrigin = 'anonymous';
+  image.decoding = 'async';
   image.onload = () => resolve(image);
   image.onerror = () => reject(new Error(`无法读取图片：${src}`));
   image.src = src;
@@ -156,8 +157,11 @@ const keepSmallestRegionForTag = (
   return regions.filter(region => region.tag !== tag || region === smallest);
 };
 
-export const analyzePoseFocus = async (src: string): Promise<PoseAnalysis> => {
-  const [landmarker, image] = await Promise.all([getLandmarker(), loadImage(src)]);
+export const analyzePoseFocus = async (input: string | HTMLImageElement | ImageBitmap): Promise<PoseAnalysis> => {
+  const [landmarker, image] = await Promise.all([
+    getLandmarker(),
+    typeof input === 'string' ? loadImage(input) : Promise.resolve(input),
+  ]);
   const result = landmarker.detect(image);
   if (result.landmarks.length === 0) {
     return { modelVersion: POSE_MODEL_VERSION, status: 'not_found', regions: [] };

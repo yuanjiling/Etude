@@ -6,6 +6,7 @@ export const CONTENT_ROUTER_VERSION = 'mediapipe-efficientdet-lite0-rules-v1';
 export const VISUAL_ANALYSIS_VERSION = 'canvas-lab-lightness-aspect-v3';
 
 const PERSON_SCORE_THRESHOLD = 0.35;
+const MAX_INFERENCE_EDGE = 1440;
 let detectorPromise: Promise<ObjectDetector> | null = null;
 
 const clamp = (value: number, min = 0, max = 1) => Math.min(max, Math.max(min, value));
@@ -13,9 +14,28 @@ const clamp = (value: number, min = 0, max = 1) => Math.min(max, Math.max(min, v
 const loadImage = (src: string) => new Promise<HTMLImageElement>((resolve, reject) => {
   const image = new Image();
   image.crossOrigin = 'anonymous';
+  image.decoding = 'async';
   image.onload = () => resolve(image);
   image.onerror = () => reject(new Error(`无法读取图片：${src}`));
   image.src = src;
+});
+
+const prepareInferenceImage = async (image: HTMLImageElement) => {
+  const longestEdge = Math.max(image.naturalWidth, image.naturalHeight);
+  if (longestEdge <= MAX_INFERENCE_EDGE || typeof createImageBitmap !== 'function') {
+    return { source: image as HTMLImageElement | ImageBitmap, release: () => undefined };
+  }
+  const scale = MAX_INFERENCE_EDGE / longestEdge;
+  const bitmap = await createImageBitmap(image, {
+    resizeWidth: Math.max(1, Math.round(image.naturalWidth * scale)),
+    resizeHeight: Math.max(1, Math.round(image.naturalHeight * scale)),
+    resizeQuality: 'medium',
+  });
+  return { source: bitmap as HTMLImageElement | ImageBitmap, release: () => bitmap.close() };
+};
+
+const yieldForBrowserFrame = () => new Promise<void>(resolve => {
+  requestAnimationFrame(() => window.setTimeout(resolve, 0));
 });
 
 const getDetector = () => {
@@ -235,25 +255,35 @@ export const visualAnalysisTags = (analysis: VisualAnalysis) => [
 
 export const analyzeContent = async (src: string) => {
   const [detector, image] = await Promise.all([getDetector(), loadImage(src)]);
-  const detectionResult = detector.detect(image);
-  const poseAnalysis = await analyzePoseFocus(src);
-  const width = Math.max(1, image.naturalWidth);
-  const height = Math.max(1, image.naturalHeight);
-  const personBoxes = detectionResult.detections.flatMap(detection => {
-    const box = detection.boundingBox;
-    const confidence = detection.categories[0]?.score ?? 0;
-    if (!box || confidence < PERSON_SCORE_THRESHOLD) return [];
-    return [{
-      x: clamp(box.originX / width),
-      y: clamp(box.originY / height),
-      width: clamp(box.width / width),
-      height: clamp(box.height / height),
-      confidence,
-    }];
-  });
-  return {
-    poseAnalysis,
-    contentRouting: routeContent(personBoxes, poseAnalysis),
-    visualAnalysis: analyzeVisual(image),
-  };
+  const inferenceImage = await prepareInferenceImage(image);
+  try {
+    const detectionResult = detector.detect(inferenceImage.source);
+    await yieldForBrowserFrame();
+    const poseAnalysis = await analyzePoseFocus(inferenceImage.source);
+    const width = Math.max(1, 'naturalWidth' in inferenceImage.source
+      ? inferenceImage.source.naturalWidth
+      : inferenceImage.source.width);
+    const height = Math.max(1, 'naturalHeight' in inferenceImage.source
+      ? inferenceImage.source.naturalHeight
+      : inferenceImage.source.height);
+    const personBoxes = detectionResult.detections.flatMap(detection => {
+      const box = detection.boundingBox;
+      const confidence = detection.categories[0]?.score ?? 0;
+      if (!box || confidence < PERSON_SCORE_THRESHOLD) return [];
+      return [{
+        x: clamp(box.originX / width),
+        y: clamp(box.originY / height),
+        width: clamp(box.width / width),
+        height: clamp(box.height / height),
+        confidence,
+      }];
+    });
+    return {
+      poseAnalysis,
+      contentRouting: routeContent(personBoxes, poseAnalysis),
+      visualAnalysis: analyzeVisual(image),
+    };
+  } finally {
+    inferenceImage.release();
+  }
 };

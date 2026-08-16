@@ -147,17 +147,11 @@ fn start_lock_monitor(window: tauri::Window, locked: bool) -> bool {
                 // Get window position and size
                 let pos = match window.outer_position() {
                     Ok(p) => p,
-                    Err(_) => {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        continue;
-                    }
+                    Err(_) => break,
                 };
                 let size = match window.outer_size() {
                     Ok(s) => s,
-                    Err(_) => {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        continue;
-                    }
+                    Err(_) => break,
                 };
 
                 // The WebView icon is visual only. Rust owns this native hit area.
@@ -222,7 +216,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
 static THUMBNAIL_LIMIT: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
-    once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
+    once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
 
 #[derive(Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -237,6 +231,16 @@ struct LibraryFile {
     thumbnail_path: Option<String>,
     relative_path: String,
     file_name: String,
+    file_size: u64,
+    modified_at: u64,
+    pixel_width: u32,
+    pixel_height: u32,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KnownLibraryImage {
+    path: String,
     file_size: u64,
     modified_at: u64,
     pixel_width: u32,
@@ -351,7 +355,8 @@ fn hidden_command(program: &Path) -> std::process::Command {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
+        // Keep model subprocesses below the WebView/UI scheduling priority.
+        command.creation_flags(0x08000000 | 0x00004000);
     }
     command
 }
@@ -482,15 +487,20 @@ fn thumbnail_cache_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 fn thumbnail_cache_key(path: &Path) -> String {
-    let path = path.to_string_lossy().replace('\\', "/");
-    #[cfg(target_os = "windows")]
-    let path = path.to_lowercase();
+    let path = normalized_path_identity(path);
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in path.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+fn normalized_path_identity(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    #[cfg(target_os = "windows")]
+    let path = path.to_lowercase();
+    path
 }
 
 fn thumbnail_path_for(path: &Path, cache_dir: &Path) -> PathBuf {
@@ -551,15 +561,23 @@ fn current_thumbnail(path: &Path, cache_dir: &Path) -> Option<PathBuf> {
     (thumbnail_modified >= source_modified).then_some(thumbnail_path)
 }
 
-fn library_file(path: &Path, library_dir: &Path, cache_dir: &Path) -> Result<LibraryFile, String> {
+fn library_file(
+    path: &Path,
+    library_dir: &Path,
+    cache_dir: &Path,
+    known: Option<&KnownLibraryImage>,
+) -> Result<LibraryFile, String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
-    let (pixel_width, pixel_height) = image::image_dimensions(path).unwrap_or((0, 0));
     let modified_at = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default();
+    let (pixel_width, pixel_height) = known
+        .filter(|image| image.file_size == metadata.len() && image.modified_at == modified_at)
+        .map(|image| (image.pixel_width, image.pixel_height))
+        .unwrap_or_else(|| image::image_dimensions(path).unwrap_or((0, 0)));
     Ok(LibraryFile {
         path: path.to_string_lossy().to_string(),
         thumbnail_path: current_thumbnail(path, cache_dir)
@@ -581,21 +599,38 @@ fn library_file(path: &Path, library_dir: &Path, cache_dir: &Path) -> Result<Lib
     })
 }
 
-fn scan_library_files(app: &tauri::AppHandle) -> Result<Vec<LibraryFile>, String> {
+fn scan_library_files(
+    app: &tauri::AppHandle,
+    known_images: Vec<KnownLibraryImage>,
+) -> Result<Vec<LibraryFile>, String> {
     let library_dir = get_library_dir(app)?;
     let cache_dir = thumbnail_cache_dir(app)?;
+    let known_images: std::collections::HashMap<String, KnownLibraryImage> = known_images
+        .into_iter()
+        .map(|image| (normalized_path_identity(Path::new(&image.path)), image))
+        .collect();
     let mut paths = Vec::new();
     collect_images(&library_dir, &mut paths)?;
     paths.sort();
     paths
         .iter()
-        .map(|path| library_file(path, &library_dir, &cache_dir))
+        .map(|path| {
+            library_file(
+                path,
+                &library_dir,
+                &cache_dir,
+                known_images.get(&normalized_path_identity(path)),
+            )
+        })
         .collect()
 }
 
 #[tauri::command]
-async fn scan_library(app: tauri::AppHandle) -> Result<Vec<LibraryFile>, String> {
-    tauri::async_runtime::spawn_blocking(move || scan_library_files(&app))
+async fn scan_library(
+    app: tauri::AppHandle,
+    known_images: Vec<KnownLibraryImage>,
+) -> Result<Vec<LibraryFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || scan_library_files(&app, known_images))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -696,7 +731,7 @@ fn import_library_files(
                 fs::copy(&source, &destination)
                     .map_err(|error| format!("导入 {} 失败: {error}", source.display()))?;
             }
-            imported.push(library_file(&destination, &library_dir, &cache_dir)?);
+            imported.push(library_file(&destination, &library_dir, &cache_dir, None)?);
         }
     }
     Ok(imported)
@@ -777,13 +812,13 @@ async fn auto_tag_images(
     ));
     fs::create_dir_all(&temp_dir).map_err(|error| error.to_string())?;
 
-    // Copy images to a temporary directory for processing
+    // Link or copy images to a temporary directory for processing
     let mut batch_paths = Vec::new();
     for (i, path) in image_paths.iter().enumerate() {
         let ext = Path::new(path).extension().unwrap_or_default();
         let temp_path = temp_dir.join(format!("{:08}.{}", i, ext.to_string_lossy()));
-        if let Err(e) = fs::copy(path, &temp_path) {
-            return Err(format!("Failed to copy image to temp dir: {}", e));
+        if let Err(e) = fs::hard_link(path, &temp_path).or_else(|_| fs::copy(path, &temp_path).map(|_| ())) {
+            return Err(format!("Failed to stage image to temp dir: {}", e));
         }
         batch_paths.push(temp_path.to_string_lossy().to_string());
     }
@@ -849,12 +884,20 @@ async fn auto_tag_images(
     Ok(parsed)
 }
 
+#[tauri::command]
+fn exit_app(app: tauri::AppHandle) {
+    LOCK_MONITOR_ACTIVE.store(false, Ordering::SeqCst);
+    LOCK_MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
+    app.exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             start_native_drag,
             set_window_click_through,
+            exit_app,
             database::read_app_state,
             database::write_app_state,
             settings::read_settings,
@@ -877,6 +920,15 @@ pub fn run() {
         .setup(|app| {
             let _ = get_tagger_dir(app.handle());
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                LOCK_MONITOR_ACTIVE.store(false, Ordering::SeqCst);
+                LOCK_MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
+                if window.label() == "main" {
+                    window.app_handle().exit(0);
+                }
+            }
         })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -909,5 +961,40 @@ mod thumbnail_tests {
             thumbnail.extension().and_then(|value| value.to_str()),
             Some("jpg")
         );
+    }
+
+    #[test]
+    fn unchanged_images_reuse_persisted_dimensions() {
+        let directory = std::env::temp_dir().join(format!(
+            "etude-library-metadata-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let image_path = directory.join("figure.jpg");
+        fs::write(&image_path, b"metadata-only-test").unwrap();
+        let metadata = fs::metadata(&image_path).unwrap();
+        let modified_at = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let known = KnownLibraryImage {
+            path: image_path.to_string_lossy().to_string(),
+            file_size: metadata.len(),
+            modified_at,
+            pixel_width: 640,
+            pixel_height: 480,
+        };
+        let record = library_file(
+            &image_path,
+            &directory,
+            &directory.join("cache"),
+            Some(&known),
+        )
+        .unwrap();
+        assert_eq!((record.pixel_width, record.pixel_height), (640, 480));
+        fs::remove_dir_all(directory).unwrap();
     }
 }

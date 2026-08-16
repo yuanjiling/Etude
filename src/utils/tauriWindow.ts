@@ -132,6 +132,11 @@ export const closeWindow = async (): Promise<void> => {
       await appWindow.close();
     } catch (err) {
       console.warn('Tauri window close error:', err);
+      try {
+        await invoke('exit_app');
+      } catch {
+        // ignore
+      }
     }
   }
 };

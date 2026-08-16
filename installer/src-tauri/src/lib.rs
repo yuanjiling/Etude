@@ -21,21 +21,112 @@ fn start_drag(window: tauri::Window) {
     let _ = window.start_dragging();
 }
 
-#[tauri::command]
-fn get_default_install_path() -> Result<String, String> {
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct InstallInfo {
+    pub default_path: String,
+    pub is_update: bool,
+    pub existing_version: Option<String>,
+    pub current_version: String,
+}
+
+fn query_reg_value(full_key: &str, value_name: &str) -> Option<String> {
+    let output = hidden_command("reg")
+        .args(["query", full_key, "/v", value_name])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.to_lowercase().starts_with(&value_name.to_lowercase()) {
+            if let Some(pos) = trimmed.find("REG_SZ") {
+                let val = trimmed[pos + 6..].trim();
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            } else if let Some(pos) = trimmed.find("REG_EXPAND_SZ") {
+                let val = trimmed[pos + 13..].trim();
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn detect_existing_installation() -> Option<(PathBuf, Option<String>)> {
+    let registry_keys = [
+        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Etude",
+        "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Etude",
+        "HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Etude",
+    ];
+
+    for key in registry_keys {
+        if let Some(loc) = query_reg_value(key, "InstallLocation") {
+            let path = PathBuf::from(&loc);
+            if path.exists() {
+                let ver = query_reg_value(key, "DisplayVersion");
+                return Some((path, ver));
+            }
+        }
+    }
+
+    // Also check default AppData location if Etude.exe exists
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
         let path = PathBuf::from(local_app_data).join("Programs").join("Etude");
-        return Ok(path.to_string_lossy().to_string());
+        if path.join("Etude.exe").exists() {
+            return Some((path, None));
+        }
+    }
+
+    None
+}
+
+fn compute_fallback_install_path() -> PathBuf {
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        return PathBuf::from(local_app_data).join("Programs").join("Etude");
     }
     if let Ok(user_profile) = std::env::var("USERPROFILE") {
-        let path = PathBuf::from(user_profile)
+        return PathBuf::from(user_profile)
             .join("AppData")
             .join("Local")
             .join("Programs")
             .join("Etude");
-        return Ok(path.to_string_lossy().to_string());
     }
-    Ok("C:\\Program Files\\Etude".to_string())
+    PathBuf::from("C:\\Program Files\\Etude")
+}
+
+#[tauri::command]
+fn get_install_info() -> Result<InstallInfo, String> {
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+
+    if let Some((existing_path, existing_version)) = detect_existing_installation() {
+        return Ok(InstallInfo {
+            default_path: existing_path.to_string_lossy().to_string(),
+            is_update: true,
+            existing_version,
+            current_version,
+        });
+    }
+
+    let default_path = compute_fallback_install_path().to_string_lossy().to_string();
+    Ok(InstallInfo {
+        default_path,
+        is_update: false,
+        existing_version: None,
+        current_version,
+    })
+}
+
+#[tauri::command]
+fn get_default_install_path() -> Result<String, String> {
+    let info = get_install_info()?;
+    Ok(info.default_path)
 }
 
 #[tauri::command]
@@ -117,7 +208,7 @@ fn perform_install(
     create_uninstaller_scripts(&dest_path)?;
 
     // 5. Register in Windows Registry (Settings -> Installed Apps)
-    register_windows_uninstall(&dest_path, "0.1.2")?;
+    register_windows_uninstall(&dest_path, "1.1.0")?;
 
     // 6. Create Desktop Shortcut
     let exe_path = dest_path.join("Etude.exe");
@@ -331,6 +422,7 @@ pub fn run() {
             exit_app,
             minimize_app,
             start_drag,
+            get_install_info,
             get_default_install_path,
             select_install_directory,
             check_process_running,

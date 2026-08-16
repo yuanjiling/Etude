@@ -13,6 +13,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { PhysicalPosition, PhysicalSize } from '@tauri-apps/api/dpi';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
+import { StartupSplash } from './components/StartupSplash';
 
 import { toggleAlwaysOnTop, setAlwaysOnTop, minimizeWindow, closeWindow, startDraggingWindow, startRightClickDrag, isTauriEnvironment } from './utils/tauriWindow';
 
@@ -65,40 +66,42 @@ const LibrarySetupGate: React.FC<{ children: React.ReactNode }> = ({ children })
     }
   };
 
-  if (state === 'ready') return <>{children}</>;
-
   return (
-    <div className="w-screen h-screen bg-stone-100 dark:bg-zinc-950 text-stone-800 dark:text-zinc-100 flex items-center justify-center p-6">
-      <div className="w-full max-w-sm rounded-2xl border border-black/5 dark:border-white/10 bg-white/80 dark:bg-zinc-900/80 shadow-xl p-7 text-center">
-        <div className="mx-auto mb-5 h-14 w-14 rounded-2xl bg-stone-900 text-white dark:bg-white dark:text-zinc-900 flex items-center justify-center">
-          <FolderOpen size={25} />
-        </div>
-        <h1 className="text-lg font-bold">选择图库目录</h1>
-        <p className="mt-2 text-xs leading-5 text-stone-500 dark:text-zinc-400">
-          画谱会读取并管理这个目录中的图片。建议选择空间充足的数据盘，原图不会写入应用数据库。
-        </p>
-        {error && <p className="mt-4 text-xs text-red-500 break-all">{error}</p>}
-        {state === 'checking' ? (
-          <div className="mt-6 text-xs text-stone-400">正在检查图库设置…</div>
-        ) : (
-          <div className="mt-6 flex flex-col gap-2">
-            <button
-              type="button"
-              onClick={chooseDirectory}
-              disabled={isChoosing}
-              className="h-10 rounded-xl bg-stone-900 text-white dark:bg-white dark:text-zinc-900 text-xs font-bold disabled:opacity-50"
-            >
-              {isChoosing ? '正在选择…' : '选择图库目录'}
-            </button>
-            {state === 'error' && (
-              <button type="button" onClick={checkStatus} className="h-8 text-xs text-stone-500 dark:text-zinc-400">
-                重新检查
+    <>
+      <div className={state === 'ready' ? 'contents' : 'hidden'}>{children}</div>
+      <AnimatePresence>
+        {state === 'checking' && <StartupSplash key="startup" />}
+      </AnimatePresence>
+      {(state === 'required' || state === 'error') && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-stone-100 p-6 text-stone-800 dark:bg-zinc-950 dark:text-zinc-100">
+          <div className="w-full max-w-sm rounded-2xl border border-black/5 bg-white/80 p-7 text-center shadow-xl dark:border-white/10 dark:bg-zinc-900/80">
+            <div className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-stone-900 text-white dark:bg-white dark:text-zinc-900">
+              <FolderOpen size={25} />
+            </div>
+            <h1 className="text-lg font-bold">选择图库目录</h1>
+            <p className="mt-2 text-xs leading-5 text-stone-500 dark:text-zinc-400">
+              画谱会读取并管理这个目录中的图片。建议选择空间充足的数据盘，原图不会写入应用数据库。
+            </p>
+            {error && <p className="mt-4 break-all text-xs text-red-500">{error}</p>}
+            <div className="mt-6 flex flex-col gap-2">
+              <button
+                type="button"
+                onClick={chooseDirectory}
+                disabled={isChoosing}
+                className="h-10 rounded-xl bg-stone-900 text-xs font-bold text-white disabled:opacity-50 dark:bg-white dark:text-zinc-900"
+              >
+                {isChoosing ? '正在选择…' : '选择图库目录'}
               </button>
-            )}
+              {state === 'error' && (
+                <button type="button" onClick={checkStatus} className="h-8 text-xs text-stone-500 dark:text-zinc-400">
+                  重新检查
+                </button>
+              )}
+            </div>
           </div>
-        )}
-      </div>
-    </div>
+        </div>
+      )}
+    </>
   );
 };
 
@@ -273,7 +276,7 @@ const MainContent = () => {
   const bgColor = darkMode ? `#18181b${bgOpacityHex}` : `#fafaf9${bgOpacityHex}`;
 
   return (
-    <div className={`flex justify-center items-center w-screen h-screen ${isDesktop ? 'p-0 bg-transparent' : 'pl-16 bg-stone-100 dark:bg-zinc-950'} text-stone-800 dark:text-zinc-100 overflow-hidden font-sans selection:bg-black/10 dark:selection:bg-white/20 relative`}>
+    <div className={`app-startup-reveal flex justify-center items-center w-screen h-screen ${isDesktop ? 'p-0 bg-transparent' : 'pl-16 bg-stone-100 dark:bg-zinc-950'} text-stone-800 dark:text-zinc-100 overflow-hidden font-sans selection:bg-black/10 dark:selection:bg-white/20 relative`}>
       {/* Global Film Grain Noise Overlay */}
       <div className="absolute inset-0 pointer-events-none opacity-[0.04] dark:opacity-[0.06] mix-blend-overlay z-[100]" style={{
         backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E")`
@@ -375,10 +378,10 @@ export default function App() {
   }, []);
 
   return (
-    <AppProvider>
-      <LibrarySetupGate>
+    <LibrarySetupGate>
+      <AppProvider>
         <MainContent />
-      </LibrarySetupGate>
-    </AppProvider>
+      </AppProvider>
+    </LibrarySetupGate>
   );
 }

@@ -105,7 +105,7 @@ export const SettingsView = () => {
   const [expandedHistoryDays, setExpandedHistoryDays] = useState<Set<string>>(() => new Set());
   const [recordingShortcut, setRecordingShortcut] = useState<PracticeShortcutAction | null>(null);
   const [shortcutError, setShortcutError] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState('0.1.2');
+  const [appVersion, setAppVersion] = useState('1.1.0');
   const [newGroupName, setNewGroupName] = useState('');
   const [groupInputError, setGroupInputError] = useState<string | null>(null);
   const [newTagInputs, setNewTagInputs] = useState<Record<string, string>>({});

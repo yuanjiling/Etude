@@ -1,6 +1,6 @@
 [package]
 name = "etude_installer"
-version = "0.1.2"
+version = "1.1.0"
 description = "画谱极简安装向导"
 authors = ["Etude"]
 edition = "2021"

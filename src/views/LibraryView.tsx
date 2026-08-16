@@ -9,6 +9,7 @@ import { FocusedPracticeImage } from '../components/FocusedPracticeImage';
 import { useAppContext } from '../context/AppContext';
 import { POSE_MODEL_VERSION } from '../services/poseFocus';
 import { CONTENT_ROUTER_VERSION, VISUAL_ANALYSIS_VERSION } from '../services/contentAnalysis';
+import { requestThumbnail } from '../services/thumbnailScheduler';
 import { FocusRegion, ImageRecord, CustomTagGroup } from '../types';
 import { getVirtualFocusTags } from '../utils/focusRegion';
 import {
@@ -70,26 +71,20 @@ type SelectionBox = {
   height: number;
 };
 
+type ScrollMetrics = {
+  visible: boolean;
+  thumbHeight: number;
+  thumbTop: number;
+};
+
+type VisibleRowRange = {
+  start: number;
+  end: number;
+  center: number;
+};
+
 const FOCUS_ID_SEPARATOR = '::focus::';
 const GALLERY_GAP = 12;
-const thumbnailRequests = new Map<string, Promise<string>>();
-const thumbnailUrlCache = new Map<string, string>();
-
-const requestThumbnail = (sourcePath: string) => {
-  const cached = thumbnailUrlCache.get(sourcePath);
-  if (cached) return Promise.resolve(cached);
-  const existing = thumbnailRequests.get(sourcePath);
-  if (existing) return existing;
-  const request = invoke<string>('get_library_thumbnail', { imagePath: sourcePath })
-    .then(path => convertFileSrc(path))
-    .then(url => {
-      thumbnailUrlCache.set(sourcePath, url);
-      return url;
-    })
-    .finally(() => thumbnailRequests.delete(sourcePath));
-  thumbnailRequests.set(sourcePath, request);
-  return request;
-};
 
 const itemAspectRatio = (item: LibraryDisplayItem) => {
   if (item.focusRegion && item.focusRegion.height > 0) {
@@ -140,6 +135,137 @@ const buildJustifiedLayout = (items: LibraryDisplayItem[], containerWidth: numbe
   });
   commitRow(true);
   return { rows, boxes };
+};
+
+const GalleryScrollbar: React.FC<{ scroller: HTMLElement | null; contentKey: string }> = ({ scroller, contentKey }) => {
+  const trackRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ pointerId: number; grabOffset: number } | null>(null);
+  const [hovered, setHovered] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [metrics, setMetrics] = useState<ScrollMetrics>({ visible: false, thumbHeight: 0, thumbTop: 0 });
+
+  const readMetrics = useCallback(() => {
+    if (!scroller) return { visible: false, thumbHeight: 0, thumbTop: 0 };
+    const viewportHeight = scroller.clientHeight;
+    const contentHeight = scroller.scrollHeight;
+    const trackHeight = trackRef.current?.clientHeight ?? viewportHeight;
+    const maxScroll = Math.max(0, contentHeight - viewportHeight);
+    if (maxScroll <= 0 || trackHeight <= 0) return { visible: false, thumbHeight: 0, thumbTop: 0 };
+    const thumbHeight = Math.min(trackHeight, Math.max(28, trackHeight * viewportHeight / contentHeight));
+    const travel = Math.max(0, trackHeight - thumbHeight);
+    return {
+      visible: true,
+      thumbHeight,
+      thumbTop: travel * Math.min(1, Math.max(0, scroller.scrollTop / maxScroll)),
+    };
+  }, [scroller]);
+
+  const syncMetrics = useCallback(() => setMetrics(readMetrics()), [readMetrics]);
+
+  useEffect(() => {
+    if (!scroller) {
+      setMetrics({ visible: false, thumbHeight: 0, thumbTop: 0 });
+      return;
+    }
+    syncMetrics();
+    const resizeObserver = new ResizeObserver(syncMetrics);
+    resizeObserver.observe(scroller);
+    if (scroller.firstElementChild) resizeObserver.observe(scroller.firstElementChild);
+    const mutationObserver = new MutationObserver(syncMetrics);
+    mutationObserver.observe(scroller, { childList: true, subtree: true });
+    scroller.addEventListener('scroll', syncMetrics, { passive: true });
+    window.addEventListener('resize', syncMetrics);
+    return () => {
+      resizeObserver.disconnect();
+      mutationObserver.disconnect();
+      scroller.removeEventListener('scroll', syncMetrics);
+      window.removeEventListener('resize', syncMetrics);
+    };
+  }, [scroller, contentKey, syncMetrics]);
+
+  const scrollFromPointer = (clientY: number, grabOffset: number) => {
+    const track = trackRef.current;
+    if (!scroller || !track) return;
+    const bounds = track.getBoundingClientRect();
+    const current = readMetrics();
+    const travel = Math.max(0, bounds.height - current.thumbHeight);
+    const maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    const thumbTop = Math.min(travel, Math.max(0, clientY - bounds.top - grabOffset));
+    scroller.scrollTop = travel > 0 ? thumbTop / travel * maxScroll : 0;
+    syncMetrics();
+  };
+
+  const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!event.isPrimary || event.button !== 0 || !metrics.visible) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const pointerY = event.clientY - bounds.top;
+    const pressedThumb = (event.target as HTMLElement).dataset.galleryScrollbarThumb !== undefined;
+    const grabOffset = pressedThumb
+      ? Math.min(metrics.thumbHeight, Math.max(0, pointerY - metrics.thumbTop))
+      : metrics.thumbHeight / 2;
+    dragRef.current = { pointerId: event.pointerId, grabOffset };
+    setDragging(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    scrollFromPointer(event.clientY, grabOffset);
+  };
+
+  const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    scrollFromPointer(event.clientY, drag.grabOffset);
+  };
+
+  const finishDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (dragRef.current?.pointerId !== event.pointerId) return;
+    dragRef.current = null;
+    setDragging(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  return (
+    <div
+      ref={trackRef}
+      aria-label="图库滚动条"
+      role="scrollbar"
+      aria-orientation="vertical"
+      aria-valuemin={0}
+      aria-valuemax={Math.max(0, (scroller?.scrollHeight || 0) - (scroller?.clientHeight || 0))}
+      aria-valuenow={Math.round(scroller?.scrollTop || 0)}
+      className={`absolute inset-y-1 right-0 z-20 w-3 cursor-pointer touch-none transition-opacity duration-150 ${metrics.visible ? 'opacity-100' : 'pointer-events-none opacity-0'}`}
+      onPointerEnter={() => setHovered(true)}
+      onPointerLeave={() => setHovered(false)}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={finishDrag}
+      onPointerCancel={finishDrag}
+    >
+      <div
+        className={`pointer-events-none absolute inset-y-0 right-0.5 w-[7px] rounded-full transition-colors duration-150 ${
+          dragging
+            ? 'bg-stone-700/20 dark:bg-white/20'
+            : hovered
+              ? 'bg-stone-600/14 dark:bg-white/14'
+              : 'bg-transparent'
+        }`}
+      />
+      <div
+        data-gallery-scrollbar-thumb
+        className={`absolute right-0.5 rounded-full transition-[width,background-color,box-shadow] duration-150 ease-out ${
+          dragging
+            ? 'w-[7px] bg-stone-900/95 shadow-sm dark:bg-white/95'
+            : hovered
+              ? 'w-[7px] bg-stone-800/82 shadow-sm dark:bg-white/85'
+              : 'w-[3px] bg-stone-700/55 dark:bg-white/60'
+        }`}
+        style={{ height: metrics.thumbHeight, transform: `translateY(${metrics.thumbTop}px)` }}
+      />
+    </div>
+  );
 };
 
 const BODY_PART_TAGS = [...BODY_PART_TAG_VALUES];
@@ -289,13 +415,14 @@ const buildLibraryFolders = (images: ImageRecord[]): LibraryFolder[] => {
 
 export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onStart }) => {
   const {
-    images, upsertImages, syncLibraryImages, updateImageTags, removeImage, settings, updateSettings,
+    images, upsertImages, syncLibraryImages, updateImageTags, updateImageThumbnail, removeImage, settings, updateSettings,
     taggingTask, localizationTask, startImageTagging, startImageLocalization,
   } = useAppContext();
   const imagesRef = useRef(images);
   const scanPromiseRef = useRef<Promise<void> | null>(null);
   const galleryViewportRef = useRef<HTMLDivElement>(null);
   const galleryGridRef = useRef<HTMLElement | null>(null);
+  const [galleryScroller, setGalleryScroller] = useState<HTMLElement | null>(null);
   const selectionStartRef = useRef<{
     x: number;
     y: number;
@@ -320,12 +447,17 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
   const [isBatchEditing, setIsBatchEditing] = useState(false);
   const [previewZoomItem, setPreviewZoomItem] = useState<{ image: ImageRecord; focusRegion?: FocusRegion } | null>(null);
   const [isImporting, setIsImporting] = useState(false);
-  const [isScanning, setIsScanning] = useState(false);
+  const [isScanning, setIsScanning] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const [practiceMinutes, setPracticeMinutes] = useState<number | string>(1);
   const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null);
   const [galleryViewportWidth, setGalleryViewportWidth] = useState(0);
+  const [visibleRows, setVisibleRows] = useState<VisibleRowRange>({ start: 0, end: 0, center: 0 });
   const thumbnailWidth = Math.min(174, Math.max(76, settings.libraryThumbnailWidth || 174));
+  const setGalleryScrollerRef = useCallback((element: HTMLElement | null) => {
+    galleryGridRef.current = element;
+    setGalleryScroller(element);
+  }, []);
 
   useEffect(() => {
     const viewport = galleryViewportRef.current;
@@ -345,7 +477,22 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
     const task = (async () => {
       setIsScanning(true);
       try {
-      const files = await invoke<LibraryFile[]>('scan_library');
+      const knownImages = imagesRef.current.flatMap(image => (
+        image.sourcePath
+          && image.fileSize !== undefined
+          && image.modifiedAt !== undefined
+          && image.pixelWidth !== undefined
+          && image.pixelHeight !== undefined
+          ? [{
+              path: image.sourcePath,
+              fileSize: image.fileSize,
+              modifiedAt: image.modifiedAt,
+              pixelWidth: image.pixelWidth,
+              pixelHeight: image.pixelHeight,
+            }]
+          : []
+      ));
+      const files = await invoke<LibraryFile[]>('scan_library', { knownImages });
       const previousByPath = new Map<string, ImageRecord>();
       imagesRef.current.forEach(image => {
         if (image.sourcePath) previousByPath.set(image.sourcePath, image);
@@ -476,6 +623,51 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
     () => buildJustifiedLayout(displayItems, galleryViewportWidth, thumbnailWidth),
     [displayItems, galleryViewportWidth, thumbnailWidth],
   );
+  const syncVisibleRows = useCallback(() => {
+    const scroller = galleryGridRef.current;
+    const rows = justifiedLayout.rows;
+    if (!scroller || rows.length === 0) {
+      setVisibleRows(current => current.start === 0 && current.end === 0 && current.center === 0
+        ? current
+        : { start: 0, end: 0, center: 0 });
+      return;
+    }
+
+    const viewportTop = scroller.scrollTop;
+    const viewportBottom = viewportTop + scroller.clientHeight;
+    let low = 0;
+    let high = rows.length - 1;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      const rowBottom = rows[middle].top + rows[middle].height + GALLERY_GAP;
+      if (rowBottom < viewportTop) low = middle + 1;
+      else high = middle;
+    }
+    const start = low;
+
+    low = start;
+    high = rows.length - 1;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (rows[middle].top > viewportBottom) high = middle - 1;
+      else low = middle;
+    }
+    const end = low;
+    const viewportCenter = viewportTop + scroller.clientHeight / 2;
+    let center = start;
+    for (let index = start + 1; index <= end; index += 1) {
+      const previousDistance = Math.abs(rows[center].top + rows[center].height / 2 - viewportCenter);
+      const nextDistance = Math.abs(rows[index].top + rows[index].height / 2 - viewportCenter);
+      if (nextDistance < previousDistance) center = index;
+    }
+    setVisibleRows(current => current.start === start && current.end === end && current.center === center
+      ? current
+      : { start, end, center });
+  }, [justifiedLayout.rows]);
+
+  useEffect(() => {
+    syncVisibleRows();
+  }, [galleryScroller, syncVisibleRows]);
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const selectedImages = useMemo(() => images.filter(img => selectedIdSet.has(img.id)), [images, selectedIdSet]);
 
@@ -901,17 +1093,24 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
       </header>
 
       <div ref={galleryViewportRef} className="relative flex-1 min-h-0 mt-3 overflow-hidden">
+        {isScanning && images.length === 0 && (
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 text-stone-400 dark:text-zinc-500">
+            <Loader2 size={18} className="animate-spin" />
+            <span className="text-[10px] font-medium">正在读取图库…</span>
+          </div>
+        )}
         <Virtuoso
           data={justifiedLayout.rows}
           computeItemKey={(_, row) => row.items.map(item => item.id).join('|')}
           increaseViewportBy={{ top: 280, bottom: 480 }}
           overscan={{ main: 240, reverse: 160 }}
-          scrollerRef={element => { galleryGridRef.current = element; }}
+          scrollerRef={setGalleryScrollerRef}
           onPointerDown={beginMarqueeSelection}
           onPointerMove={updateMarqueeSelection}
           onPointerUp={endMarqueeSelection}
           onPointerCancel={endMarqueeSelection}
           onScroll={() => {
+            syncVisibleRows();
             const start = selectionStartRef.current;
             if (start?.active) updateMarqueeAt(start.lastClientX, start.lastClientY);
           }}
@@ -921,16 +1120,22 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
             event.stopPropagation();
             suppressCardClickRef.current = false;
           }}
-          className="absolute inset-0 overscroll-contain select-none touch-pan-y [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
-          itemContent={(_, row) => (
-            <div className="flex" style={{ height: row.height + GALLERY_GAP, gap: GALLERY_GAP, paddingBottom: GALLERY_GAP }}>
-              {row.items.map(item => (
+          className="absolute inset-0 w-full max-w-full overflow-x-hidden overscroll-contain select-none touch-pan-y [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
+          itemContent={(rowIndex, row) => (
+            <div className="flex w-full max-w-full overflow-hidden" style={{ height: row.height + GALLERY_GAP, gap: GALLERY_GAP, paddingBottom: GALLERY_GAP }}>
+              {row.items.map((item, itemIndex) => (
                 <div key={item.id} className="h-full min-w-0" style={{ width: item.width, height: row.height, flex: '0 0 auto' }}>
                   <ImageCard
                     itemId={item.id}
                     image={item.image}
                     tags={item.tags}
                     focusRegion={item.focusRegion}
+                    thumbnailPriority={
+                      Math.abs(rowIndex - visibleRows.center) * 100
+                      + Math.abs(itemIndex - (row.items.length - 1) / 2)
+                    }
+                    useSourceFallback={rowIndex >= visibleRows.start && rowIndex <= visibleRows.end}
+                    onThumbnailChange={url => updateImageThumbnail(item.image.id, url)}
                     selected={selectedIdSet.has(item.id)}
                     onSelect={() => toggleSelection(item.id)}
                     onPreview={() => setPreviewZoomItem({ image: item.image, focusRegion: item.focusRegion })}
@@ -947,6 +1152,10 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
               ))}
             </div>
           )}
+        />
+        <GalleryScrollbar
+          scroller={galleryScroller}
+          contentKey={`${justifiedLayout.rows.length}:${justifiedLayout.rows.at(-1)?.top || 0}:${justifiedLayout.rows.at(-1)?.height || 0}`}
         />
         {selectionBox && (
           <div
@@ -1314,39 +1523,79 @@ const ImageCard: React.FC<{
   image: ImageRecord;
   tags: string[];
   focusRegion?: FocusRegion;
+  thumbnailPriority: number;
+  useSourceFallback: boolean;
+  onThumbnailChange: (url?: string) => void;
   selected: boolean;
   onSelect: () => void;
   onPreview: () => void;
   onEdit: () => void;
-}> = ({ itemId, image, tags, focusRegion, selected, onSelect, onPreview, onEdit }) => {
-  const [previewUrl, setPreviewUrl] = useState<string | null>(
-    image.thumbnailUrl || (!image.sourcePath ? image.url : null),
-  );
+}> = ({ itemId, image, tags, focusRegion, thumbnailPriority, useSourceFallback, onThumbnailChange, selected, onSelect, onPreview, onEdit }) => {
+  const cardRef = useRef<HTMLDivElement>(null);
+  const onThumbnailChangeRef = useRef(onThumbnailChange);
+  onThumbnailChangeRef.current = onThumbnailChange;
+  const [isNearViewport, setIsNearViewport] = useState(false);
+  const [failedPreviewUrl, setFailedPreviewUrl] = useState<string | null>(null);
+  const [generatedThumbnail, setGeneratedThumbnail] = useState<{ sourcePath: string; url: string } | null>(null);
+  const generatedUrl = generatedThumbnail?.sourcePath === image.sourcePath ? generatedThumbnail.url : null;
+  const thumbnailUrl = image.thumbnailUrl || generatedUrl;
+  const canUseSource = !image.sourcePath || useSourceFallback || isNearViewport;
+  const previewUrl = thumbnailUrl && thumbnailUrl !== failedPreviewUrl
+    ? thumbnailUrl
+    : canUseSource ? image.url : null;
+  const effectiveThumbnailPriority = isNearViewport ? 0 : thumbnailPriority;
   const tagSummary = thumbnailTagSummary(tags, focusRegion, image.tagStatus === 'tagged');
 
   useEffect(() => {
-    const immediateUrl = image.thumbnailUrl || (!image.sourcePath ? image.url : null);
-    setPreviewUrl(immediateUrl);
-    if (immediateUrl || !image.sourcePath) return;
+    const card = cardRef.current;
+    if (!card) return;
+    const observer = new IntersectionObserver(([entry]) => {
+      setIsNearViewport(entry.isIntersecting);
+    }, { rootMargin: '120px 0px', threshold: 0.01 });
+    observer.observe(card);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (image.thumbnailUrl || !image.sourcePath) return;
     let disposed = false;
-    requestThumbnail(image.sourcePath)
+    const request = requestThumbnail(image.sourcePath, effectiveThumbnailPriority);
+    request.promise
       .then(url => {
-        if (!disposed) setPreviewUrl(url);
+        if (!disposed) {
+          setFailedPreviewUrl(null);
+          setGeneratedThumbnail({ sourcePath: image.sourcePath!, url });
+          onThumbnailChangeRef.current(url);
+        }
       })
-      .catch(error => console.warn(`Thumbnail generation failed for ${image.fileName || image.id}:`, error));
-    return () => { disposed = true; };
-  }, [image.fileName, image.id, image.sourcePath, image.thumbnailUrl, image.url]);
+      .catch(error => {
+        if (!disposed && !(error instanceof DOMException && error.name === 'AbortError')) {
+          console.warn(`Thumbnail generation failed for ${image.fileName || image.id}:`, error);
+        }
+      });
+    return () => {
+      disposed = true;
+      request.cancel();
+    };
+  }, [effectiveThumbnailPriority, image.fileName, image.id, image.sourcePath, image.thumbnailUrl, image.url]);
+
+  const handlePreviewError = () => {
+    if (!previewUrl || previewUrl === image.url) return;
+    setFailedPreviewUrl(previewUrl);
+    setGeneratedThumbnail(null);
+    onThumbnailChangeRef.current(undefined);
+  };
 
   return (
-  <div data-library-card data-library-item-id={itemId} onDragStart={event => event.preventDefault()} className="h-full select-none">
+  <div ref={cardRef} data-library-card data-library-item-id={itemId} onDragStart={event => event.preventDefault()} className="h-full select-none">
     <GlassCard className={`group/card relative h-full overflow-hidden !rounded-xl border transition-all cursor-pointer ${selected ? '!border-stone-800 dark:!border-white ring-2 ring-stone-800/20 dark:ring-white/20' : 'border-transparent'}`}>
       <button onClick={onPreview} onDragStart={event => event.preventDefault()} title="点击放大预览" className="relative block w-full h-full touch-none select-none text-left bg-stone-200/70 dark:bg-zinc-800">
         {focusRegion
           ? previewUrl
-            ? <FocusedPracticeImage image={image} src={previewUrl} region={focusRegion} flipped={false} grayscale={false} quickFade />
+            ? <FocusedPracticeImage image={image} src={previewUrl} region={focusRegion} flipped={false} grayscale={false} quickFade onImageError={handlePreviewError} />
             : <ThumbnailPlaceholder />
           : previewUrl
-            ? <FadeInThumbnail src={previewUrl} alt={image.fileName || ''} />
+            ? <FadeInThumbnail src={previewUrl} alt={image.fileName || ''} onError={handlePreviewError} />
             : <ThumbnailPlaceholder />}
       </button>
       <button
@@ -1390,7 +1639,7 @@ const ThumbnailPlaceholder = () => (
   <div className="pointer-events-none absolute inset-0 animate-pulse bg-gradient-to-br from-stone-200 via-stone-100 to-stone-200 dark:from-zinc-800 dark:via-zinc-700 dark:to-zinc-800" />
 );
 
-const FadeInThumbnail = ({ src, alt }: { src: string; alt: string }) => {
+const FadeInThumbnail = ({ src, alt, onError }: { src: string; alt: string; onError?: () => void }) => {
   const imageRef = useRef<HTMLImageElement>(null);
   const [loaded, setLoaded] = useState(false);
   const revealFrameRef = useRef<number | null>(null);
@@ -1437,6 +1686,8 @@ const FadeInThumbnail = ({ src, alt }: { src: string; alt: string }) => {
         loading="eager"
         decoding="async"
         onLoad={reveal}
+        onError={onError}
+        fetchPriority="high"
         className={`pointer-events-none absolute inset-0 h-full w-full select-none object-cover will-change-[opacity,transform] transition-[opacity,transform] duration-300 ease-out ${loaded ? 'scale-100 opacity-100' : 'scale-[1.015] opacity-0'}`}
       />
     </>

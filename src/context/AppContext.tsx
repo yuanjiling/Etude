@@ -1,9 +1,13 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { ImageRecord, PracticeSet, HistoryRecord, PracticeConfig, AppSettings, CustomTagGroup } from '../types';
-import { MOCK_IMAGES, INITIAL_SETS } from '../data';
+import { INITIAL_SETS } from '../data';
 import { analyzeContent, visualAnalysisTags } from '../services/contentAnalysis';
 import { mapModelTags } from '../utils/modelTags';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { isTauriEnvironment } from '../utils/tauriWindow';
+import { StartupSplash } from '../components/StartupSplash';
+import { setThumbnailSchedulerPaused } from '../services/thumbnailScheduler';
 
 export type LibraryTaskState = {
   running: boolean;
@@ -22,6 +26,7 @@ interface AppState {
   updateSettings: (newSettings: Partial<AppSettings>) => void;
   toggleDarkMode: () => void;
   updateImageTags: (id: string, tags: string[]) => void;
+  updateImageThumbnail: (id: string, thumbnailUrl?: string) => void;
   toggleImageFavorite: (id: string) => void;
   toggleImageHidden: (id: string) => void;
   addImages: (newImgs: ImageRecord[]) => void;
@@ -118,7 +123,36 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [localizationTask, setLocalizationTask] = useState<LibraryTaskState>({ running: false, current: 0, total: 0 });
   const taggingRunningRef = useRef(false);
   const localizationRunningRef = useRef(false);
+  const lastUiInteractionRef = useRef(0);
   const persistenceEnabledRef = useRef(false);
+  const latestStateRef = useRef({ images, sets, history, settings });
+  latestStateRef.current = { images, sets, history, settings };
+  const saveTimeoutRef = useRef<number | null>(null);
+  const lastSaveTimeRef = useRef<number>(Date.now());
+
+  useEffect(() => {
+    const markInteraction = () => { lastUiInteractionRef.current = performance.now(); };
+    const events: Array<keyof WindowEventMap> = ['pointerdown', 'pointermove', 'wheel', 'keydown'];
+    events.forEach(event => window.addEventListener(event, markInteraction, { passive: true }));
+    return () => events.forEach(event => window.removeEventListener(event, markInteraction));
+  }, []);
+
+  const flushSave = async () => {
+    if (!persistenceEnabledRef.current) return;
+    if (saveTimeoutRef.current !== null) {
+      window.clearTimeout(saveTimeoutRef.current);
+      saveTimeoutRef.current = null;
+    }
+    lastSaveTimeRef.current = Date.now();
+    const latest = latestStateRef.current;
+    try {
+      await invoke('write_app_state', {
+        data: JSON.stringify({ images: latest.images, sets: latest.sets, history: latest.history }),
+      });
+    } catch (err) {
+      console.warn('Failed to save app state to SQLite:', err);
+    }
+  };
 
   // Load Data
   useEffect(() => {
@@ -131,7 +165,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (json && json !== '{}') {
           const data = JSON.parse(json);
           if (data.images) setImages(data.images);
-          else setImages(MOCK_IMAGES);
+          else setImages([]);
 
           if (data.sets && Array.isArray(data.sets)) {
             const hasOldDefault = data.sets.some((s: any) => (s.id === 's1' && s.name === '动态热身') || (s.id === 's2' && s.name === '头像速写'));
@@ -146,34 +180,46 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
           if (data.history) setHistory(data.history);
         } else {
-          setImages(MOCK_IMAGES);
+          setImages([]);
           setSets(INITIAL_SETS);
         }
         setSettings(loadSettings(settingsJson && settingsJson !== '{}' ? JSON.parse(settingsJson) : undefined));
       } catch (err) {
         console.warn('Failed to load data from Tauri:', err);
-        setImages(MOCK_IMAGES);
+        setImages([]);
         setSets(INITIAL_SETS);
-        persistenceEnabledRef.current = true;
       } finally {
+        persistenceEnabledRef.current = true;
         setIsLoaded(true);
       }
     };
     loadData();
   }, []);
 
-  // Save database-backed application data as one transaction.
+  // Save database-backed application data with Debounce + MaxWait (2.5s) throttle.
   useEffect(() => {
     if (!isLoaded || !persistenceEnabledRef.current) return;
-    const saveTimer = window.setTimeout(async () => {
-      const data = { images, sets, history };
-      try {
-        await invoke('write_app_state', { data: JSON.stringify(data) });
-      } catch (err) {
-        console.warn('Failed to save app state to SQLite:', err);
-      }
+    const now = Date.now();
+    const timeSinceLastSave = now - lastSaveTimeRef.current;
+
+    if (timeSinceLastSave >= 2500) {
+      void flushSave();
+      return;
+    }
+
+    if (saveTimeoutRef.current !== null) {
+      window.clearTimeout(saveTimeoutRef.current);
+    }
+
+    saveTimeoutRef.current = window.setTimeout(() => {
+      void flushSave();
     }, 500);
-    return () => window.clearTimeout(saveTimer);
+
+    return () => {
+      if (saveTimeoutRef.current !== null) {
+        window.clearTimeout(saveTimeoutRef.current);
+      }
+    };
   }, [images, sets, history, isLoaded]);
 
   // Settings are intentionally independent from the library database.
@@ -188,6 +234,40 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }, 500);
     return () => window.clearTimeout(saveTimer);
   }, [settings, isLoaded]);
+
+  // Flush the latest snapshot before the desktop window is destroyed.
+  useEffect(() => {
+    if (!isLoaded || !persistenceEnabledRef.current || !isTauriEnvironment()) return;
+    const appWindow = getCurrentWindow();
+    let isClosing = false;
+    const unlisten = appWindow.onCloseRequested(async event => {
+      if (isClosing) {
+        event.preventDefault();
+        return;
+      }
+      event.preventDefault();
+      isClosing = true;
+      const latest = latestStateRef.current;
+      try {
+        await Promise.race([
+          Promise.all([
+            invoke('write_app_state', { data: JSON.stringify({ images: latest.images, sets: latest.sets, history: latest.history }) }),
+            invoke('write_settings', { data: JSON.stringify(latest.settings) }),
+          ]),
+          new Promise(resolve => setTimeout(resolve, 1000)),
+        ]);
+      } catch (error) {
+        console.warn('Failed to flush application data before closing:', error);
+      } finally {
+        try {
+          await invoke('exit_app');
+        } catch {
+          await appWindow.destroy();
+        }
+      }
+    });
+    return () => { void unlisten.then(dispose => dispose()); };
+  }, [isLoaded]);
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)');
@@ -217,6 +297,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setImages(prev => prev.map(img => img.id === id ? { ...img, tags } : img));
   };
 
+  const updateImageThumbnail = (id: string, thumbnailUrl?: string) => {
+    setImages(prev => prev.map(img => (
+      img.id === id && img.thumbnailUrl !== thumbnailUrl ? { ...img, thumbnailUrl } : img
+    )));
+  };
+
   const toggleImageFavorite = (id: string) => {
     setImages(prev => prev.map(img => img.id === id ? { ...img, favorite: !img.favorite } : img));
   };
@@ -243,18 +329,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
   };
 
+  type AnalysisUpdateItem = {
+    target: ImageRecord;
+    patch: Partial<ImageRecord>;
+    expectedScope?: string;
+  };
+
+  const updateImagesAnalysisBatch = (updates: AnalysisUpdateItem[]) => {
+    if (updates.length === 0) return;
+    const patchByPath = new Map<string, { patch: Partial<ImageRecord>; expectedScope?: string }>();
+    const patchById = new Map<string, { patch: Partial<ImageRecord>; expectedScope?: string }>();
+    for (const update of updates) {
+      const scope = update.expectedScope ?? update.target.contentRouting?.scope;
+      if (update.target.sourcePath) patchByPath.set(update.target.sourcePath, { patch: update.patch, expectedScope: scope });
+      if (update.target.id) patchById.set(update.target.id, { patch: update.patch, expectedScope: scope });
+    }
+    setImages(current => current.map(image => {
+      const match = (image.sourcePath && patchByPath.get(image.sourcePath)) || patchById.get(image.id);
+      if (!match) return image;
+      if (match.expectedScope && image.contentRouting?.scope && image.contentRouting.scope !== match.expectedScope) {
+        return image;
+      }
+      return { ...image, ...match.patch };
+    }));
+  };
+
   const updateImageAnalysis = (
     target: ImageRecord,
     patch: Partial<ImageRecord>,
     expectedScope = target.contentRouting?.scope,
   ) => {
-    setImages(current => current.map(image => (
-      (target.sourcePath && image.sourcePath === target.sourcePath) || image.id === target.id
-        ? expectedScope && image.contentRouting?.scope && image.contentRouting.scope !== expectedScope
-          ? image
-          : { ...image, ...patch }
-        : image
-    )));
+    updateImagesAnalysisBatch([{ target, patch, expectedScope }]);
   };
 
   const startImageTagging = async (targets: ImageRecord[]) => {
@@ -265,19 +370,41 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     taggingRunningRef.current = true;
     setTaggingTask({ running: true, current: 0, total: queue.length });
     const applied = new Set<number>();
+    const bufferedUpdates: AnalysisUpdateItem[] = [];
+    let lastFlushTime = Date.now();
+    let lastTaskTime = 0;
+
+    const flushBatch = () => {
+      if (bufferedUpdates.length === 0) return;
+      const batch = bufferedUpdates.splice(0, bufferedUpdates.length);
+      updateImagesAnalysisBatch(batch);
+      lastFlushTime = Date.now();
+    };
+
     try {
       const progress = new Channel<Record<string, unknown>>();
       progress.onmessage = message => {
         const current = Number(message.current) || 0;
-        setTaggingTask({ running: true, current, total: queue.length });
+        const now = Date.now();
+        if (now - lastTaskTime >= 120 || current === queue.length) {
+          lastTaskTime = now;
+          setTaggingTask({ running: true, current, total: queue.length });
+        }
         if (current < 1 || current > queue.length || !message.result) return;
         const index = current - 1;
         applied.add(index);
-        updateImageAnalysis(queue[index], {
-          tags: mapModelTags(message.result),
-          tagStatus: 'tagged',
-          tagError: undefined,
-        }, 'human_dominant');
+        bufferedUpdates.push({
+          target: queue[index],
+          patch: {
+            tags: mapModelTags(message.result),
+            tagStatus: 'tagged',
+            tagError: undefined,
+          },
+          expectedScope: 'human_dominant',
+        });
+        if (bufferedUpdates.length >= 5 || now - lastFlushTime >= 200) {
+          flushBatch();
+        }
       };
       const results = await invoke<unknown[]>('auto_tag_images', {
         imagePaths: queue.map(image => image.sourcePath),
@@ -285,12 +412,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
       results.forEach((result, index) => {
         if (applied.has(index) || !queue[index]) return;
-        updateImageAnalysis(queue[index], {
-          tags: mapModelTags(result),
-          tagStatus: 'tagged',
-          tagError: undefined,
-        }, 'human_dominant');
+        bufferedUpdates.push({
+          target: queue[index],
+          patch: {
+            tags: mapModelTags(result),
+            tagStatus: 'tagged',
+            tagError: undefined,
+          },
+          expectedScope: 'human_dominant',
+        });
       });
+      flushBatch();
+      void flushSave();
       setTaggingTask({
         running: false,
         current: results.length,
@@ -298,6 +431,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         message: `已完成 ${results.length} 张图片的自动打标`,
       });
     } catch (error) {
+      flushBatch();
+      void flushSave();
       console.warn('Background tagging failed:', error);
       setTaggingTask(current => ({ ...current, running: false, error: String(error) }));
     } finally {
@@ -309,12 +444,45 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const queue = targets.filter(image => Boolean(image.sourcePath));
     if (localizationRunningRef.current || queue.length === 0) return;
     localizationRunningRef.current = true;
+    setThumbnailSchedulerPaused(true);
     setLocalizationTask({ running: true, current: 0, total: queue.length });
     let completed = 0;
     let failed = 0;
     let regionCount = 0;
+    const bufferedUpdates: AnalysisUpdateItem[] = [];
+    let lastFlushTime = Date.now();
+    let lastTaskTime = 0;
+
+    const flushBatch = () => {
+      if (bufferedUpdates.length === 0) return;
+      const batch = bufferedUpdates.splice(0, bufferedUpdates.length);
+      updateImagesAnalysisBatch(batch);
+      lastFlushTime = Date.now();
+    };
+
+    const waitForAnalysisSlot = () => new Promise<void>(resolve => {
+      const waitUntilQuiet = () => {
+        const quietFor = performance.now() - lastUiInteractionRef.current;
+        if (quietFor < 120) {
+          globalThis.setTimeout(waitUntilQuiet, Math.ceil(120 - quietFor));
+          return;
+        }
+        const timeout = taggingRunningRef.current ? 500 : 240;
+        if ('requestIdleCallback' in window) {
+          window.requestIdleCallback(() => {
+            if (performance.now() - lastUiInteractionRef.current < 120) waitUntilQuiet();
+            else resolve();
+          }, { timeout });
+        } else {
+          globalThis.setTimeout(resolve, taggingRunningRef.current ? 100 : 32);
+        }
+      };
+      waitUntilQuiet();
+    });
+
     try {
       for (const image of queue) {
+        await waitForAnalysisSlot();
         try {
           const analysis = await analyzeContent(image.url);
           const contentRouting = image.contentRouting?.manuallyCorrected
@@ -336,24 +504,42 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             patch.poseAnalysis = analysis.poseAnalysis;
             patch.visualAnalysis = undefined;
           }
-          updateImageAnalysis(image, patch, contentRouting.scope);
+          bufferedUpdates.push({ target: image, patch, expectedScope: contentRouting.scope });
           completed += 1;
           regionCount += analysis.poseAnalysis.regions.length;
         } catch (error) {
           failed += 1;
           console.warn(`Pose localization failed for ${image.fileName || image.id}:`, error);
         }
-        setLocalizationTask({ running: true, current: completed + failed, total: queue.length });
-        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+
+        const now = Date.now();
+        if (bufferedUpdates.length >= 5 || now - lastFlushTime >= 200) {
+          flushBatch();
+        }
+        if (now - lastTaskTime >= 120 || (completed + failed) === queue.length) {
+          lastTaskTime = now;
+          setLocalizationTask({ running: true, current: completed + failed, total: queue.length });
+        }
+
+        // Yield to the main browser thread to allow UI rendering and smooth user interaction
+        await new Promise<void>(resolve => setTimeout(resolve, taggingRunningRef.current ? 48 : 12));
       }
+      flushBatch();
+      void flushSave();
       setLocalizationTask({
         running: false,
         current: queue.length,
         total: queue.length,
         message: `已分析 ${completed} 张图片，生成 ${regionCount} 个虚拟局部${failed > 0 ? `，${failed} 张失败` : ''}`,
       });
+    } catch (error) {
+      flushBatch();
+      void flushSave();
+      console.warn('Localization task failed:', error);
+      setLocalizationTask(current => ({ ...current, running: false, error: String(error) }));
     } finally {
       localizationRunningRef.current = false;
+      setThumbnailSchedulerPaused(false);
     }
   };
 
@@ -409,14 +595,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   if (!isLoaded) {
-    return <div className="h-screen w-screen flex items-center justify-center bg-stone-100 dark:bg-zinc-950 text-black dark:text-white font-bold text-sm">正在加载配置...</div>;
+    return <StartupSplash />;
   }
 
   return (
     <AppContext.Provider value={{
       images, sets, history, darkMode, toggleDarkMode,
       settings, updateSettings,
-      updateImageTags, toggleImageFavorite, toggleImageHidden, addImages, upsertImages, syncLibraryImages, removeImage, saveSet, deleteSet, addHistory, clearHistory,
+      updateImageTags, updateImageThumbnail, toggleImageFavorite, toggleImageHidden, addImages, upsertImages, syncLibraryImages, removeImage, saveSet, deleteSet, addHistory, clearHistory,
       taggingTask, localizationTask, startImageTagging, startImageLocalization,
     }}>
       {children}
