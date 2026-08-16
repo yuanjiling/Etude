@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Component, type ReactNode, type ErrorInfo } from 'react';
 import { AppProvider, useAppContext } from './context/AppContext';
 import { ViewMode } from './types';
 import { PracticeView } from './views/PracticeView';
@@ -9,8 +9,6 @@ import { PracticeWindow } from './views/PracticeWindow';
 import { SettingsView } from './views/SettingsView';
 import { Layout, Image as ImageIcon, Layers, Clock, Settings, Moon, Sun, Pin, Minus, X, FolderOpen } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { getCurrentWindow } from '@tauri-apps/api/window';
-import { PhysicalPosition, PhysicalSize } from '@tauri-apps/api/dpi';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { StartupSplash } from './components/StartupSplash';
@@ -219,9 +217,10 @@ const ControlBar = () => {
 };
 
 const MainContent = () => {
-  const { settings, darkMode, updateSettings } = useAppContext();
+  const { settings, darkMode } = useAppContext();
   const [currentView, setCurrentView] = useState<ViewMode>('practice');
   const [practiceConfig, setPracticeConfig] = useState<any>(null);
+  const [libraryLocate, setLibraryLocate] = useState<{ imageId: string; nonce: number } | null>(null);
 
   const startPractice = (config: any) => {
     setPracticeConfig(config);
@@ -233,42 +232,17 @@ const MainContent = () => {
     setCurrentView('practice');
   };
 
-  useEffect(() => {
-    if (!isTauriEnvironment() || !settings.rememberWindowBounds) return;
-    const appWindow = getCurrentWindow();
-    let disposed = false;
-    let saveTimer: number | undefined;
-    const restore = async () => {
-      if (settings.windowBounds) {
-        const { x, y, width, height } = settings.windowBounds;
-        const hasUsablePosition = Number.isFinite(x) && Number.isFinite(y) && x > -30000 && y > -30000;
-        if (hasUsablePosition) {
-          await appWindow.setPosition(new PhysicalPosition(x, y));
-        }
-        await appWindow.setSize(new PhysicalSize(Math.max(320, width), Math.max(480, height)));
-      }
-    };
-    const saveBounds = () => {
-      window.clearTimeout(saveTimer);
-      saveTimer = window.setTimeout(async () => {
-        if (disposed) return;
-        if (await appWindow.isMinimized()) return;
-        const [position, size] = await Promise.all([appWindow.outerPosition(), appWindow.outerSize()]);
-        if (position.x <= -30000 || position.y <= -30000 || size.width < 320 || size.height < 480) return;
-        updateSettings({ windowBounds: { x: position.x, y: position.y, width: size.width, height: size.height } });
-      }, 250);
-    };
-    restore().catch(console.warn);
-    const listeners = Promise.all([appWindow.onMoved(saveBounds), appWindow.onResized(saveBounds)]);
-    return () => {
-      disposed = true;
-      window.clearTimeout(saveTimer);
-      listeners.then(unlisteners => unlisteners.forEach(unlisten => unlisten())).catch(console.warn);
-    };
-  }, [settings.rememberWindowBounds]);
+  const locateImageInLibrary = (imageId: string) => {
+    setLibraryLocate({ imageId, nonce: Date.now() });
+    setCurrentView('library');
+  };
 
   if (currentView === 'active_practice') {
-    return <PracticeWindow config={practiceConfig} onExit={endPractice} />;
+    return (
+      <div className="w-screen h-screen relative overflow-hidden select-none text-white">
+        <PracticeWindow config={practiceConfig} onExit={endPractice} />
+      </div>
+    );
   }
 
   const isDesktop = isTauriEnvironment();
@@ -318,9 +292,15 @@ const MainContent = () => {
               className="absolute inset-0 flex flex-col w-full min-h-full overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
             >
               {currentView === 'practice' && <PracticeView onStart={startPractice} />}
-              {currentView === 'library' && <LibraryView onStart={startPractice} />}
+              {currentView === 'library' && (
+                <LibraryView
+                  onStart={startPractice}
+                  locateTarget={libraryLocate}
+                  onLocateHandled={() => setLibraryLocate(null)}
+                />
+              )}
               {currentView === 'sets' && <SetsView onStart={startPractice} />}
-              {currentView === 'settings' && <SettingsView />}
+              {currentView === 'settings' && <SettingsView onLocateImage={locateImageInLibrary} />}
             </motion.div>
           </AnimatePresence>
         </div>
@@ -330,6 +310,53 @@ const MainContent = () => {
     </div>
   );
 };
+
+interface ErrorBoundaryProps {
+  children: ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class AppErrorBoundary extends (React.Component as any) {
+  state: ErrorBoundaryState = { hasError: false, error: null };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error('Unhandled React Error:', error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="w-screen h-screen flex flex-col items-center justify-center bg-zinc-950 text-white p-6 select-none">
+          <div className="max-w-md w-full rounded-2xl bg-zinc-900 border border-white/10 p-6 flex flex-col items-center text-center shadow-2xl">
+            <h2 className="text-base font-bold mb-2 text-red-400">页面渲染遇到异常</h2>
+            <p className="text-xs text-zinc-400 mb-4 leading-relaxed">
+              {this.state.error?.message || '发生未知渲染错误'}
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                this.setState({ hasError: false, error: null });
+                window.location.reload();
+              }}
+              className="px-5 py-2 rounded-xl bg-white text-zinc-900 font-bold text-xs hover:bg-stone-200 active:scale-95 transition-all cursor-pointer"
+            >
+              重新加载
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 export default function App() {
   // Global event listeners for disabling web context menu and enabling right-click drag
@@ -378,10 +405,12 @@ export default function App() {
   }, []);
 
   return (
-    <LibrarySetupGate>
-      <AppProvider>
-        <MainContent />
-      </AppProvider>
-    </LibrarySetupGate>
+    <AppErrorBoundary>
+      <LibrarySetupGate>
+        <AppProvider>
+          <MainContent />
+        </AppProvider>
+      </LibrarySetupGate>
+    </AppErrorBoundary>
   );
 }

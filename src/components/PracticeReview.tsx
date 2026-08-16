@@ -1,8 +1,9 @@
-import React from 'react';
+import React, { useEffect, memo } from 'react';
 import { motion } from 'motion/react';
 import { X, Play } from 'lucide-react';
 import type { ImageRecord, FocusRegion } from '../types';
 import { FocusedPracticeImage } from './FocusedPracticeImage';
+import { setPracticeLocked, isTauriEnvironment } from '../utils/tauriWindow';
 
 interface PracticeReviewProps {
   items: { image: ImageRecord; focusRegion?: FocusRegion }[];
@@ -18,45 +19,86 @@ const formatTime = (sec: number) => {
   return `${m}分${s}秒`;
 };
 
+const ReviewImageCard = memo<{
+  item: { image: ImageRecord; focusRegion?: FocusRegion };
+  onContinue: () => void;
+}>(({ item, onContinue }) => {
+  const displaySrc = item.image.thumbnail || item.image.previewUrl || item.image.url;
+
+  return (
+    <div 
+      className="group/rcard relative aspect-[3/4] bg-zinc-900 rounded-xl overflow-hidden cursor-pointer border border-white/5 hover:border-white/20 transition-all hover:scale-[1.02] active:scale-95"
+      onClick={onContinue}
+    >
+      {item.focusRegion ? (
+        <FocusedPracticeImage 
+          image={item.image} 
+          region={item.focusRegion} 
+          src={displaySrc}
+          flipped={false} 
+          grayscale={false} 
+          quickFade 
+        />
+      ) : (
+        <img
+          src={displaySrc}
+          loading="lazy"
+          decoding="async"
+          className="w-full h-full object-cover transition-transform duration-300 group-hover/rcard:scale-105 opacity-90 group-hover/rcard:opacity-100"
+          alt=""
+        />
+      )}
+      <div className="absolute inset-0 bg-black/0 group-hover/rcard:bg-black/20 transition-colors flex items-center justify-center opacity-0 group-hover/rcard:opacity-100">
+        <div className="w-8 h-8 rounded-full bg-white/90 text-black flex items-center justify-center shadow-lg">
+          <Play size={14} className="fill-current translate-x-0.5" />
+        </div>
+      </div>
+    </div>
+  );
+});
+
+ReviewImageCard.displayName = 'ReviewImageCard';
+
 export const PracticeReview: React.FC<PracticeReviewProps> = ({ items, totalElapsedSec, onExit, onContinueDrawing }) => {
+  // 进入回顾界面时，双重确保强制解除点击穿透锁定
+  useEffect(() => {
+    if (isTauriEnvironment()) {
+      setPracticeLocked(false).catch(console.warn);
+    }
+  }, []);
+
   return (
     <motion.div 
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      className="absolute inset-0 z-[100] bg-zinc-950 text-white flex flex-col p-6 rounded-2xl overflow-hidden"
+      className="absolute inset-0 z-[100] bg-zinc-950 text-white flex flex-col p-6 rounded-2xl overflow-hidden select-none pointer-events-auto"
     >
-      <div className="flex items-center justify-between mb-8">
+      <div className="flex items-center justify-between mb-6 shrink-0">
         <div>
-          <h2 className="text-2xl font-bold tracking-tight mb-1">练习回顾</h2>
-          <p className="text-sm text-stone-400">
+          <h2 className="text-xl font-bold tracking-tight mb-0.5">练习回顾</h2>
+          <p className="text-xs text-stone-400">
             本次完成 {items.length} 张练习，总计耗时 {formatTime(totalElapsedSec)}
           </p>
         </div>
         <button 
+          type="button"
           onClick={onExit}
-          className="w-10 h-10 rounded-xl bg-white/5 hover:bg-white/10 flex items-center justify-center transition-colors text-white"
+          className="w-9 h-9 rounded-xl bg-white/10 hover:bg-white/20 active:scale-95 flex items-center justify-center transition-all text-white cursor-pointer"
+          title="退出回顾"
         >
-          <X size={20} />
+          <X size={18} />
         </button>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-y-auto pr-2 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
+      <div className="flex-1 min-h-0 overflow-y-auto pr-1 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3.5 pb-4">
           {items.map((item, idx) => (
-            <div 
-              key={`${item.image.id}-${idx}`} 
-              className="group relative aspect-[3/4] bg-zinc-900 rounded-xl overflow-hidden cursor-pointer"
-              onClick={() => onContinueDrawing(item.image, item.focusRegion)}
-            >
-              {item.focusRegion
-                ? <FocusedPracticeImage image={item.image} region={item.focusRegion} flipped={false} grayscale={false} quickFade />
-                : <img
-                    src={item.image.url}
-                    className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105 opacity-90 group-hover:opacity-100"
-                    alt=""
-                  />}
-            </div>
+            <ReviewImageCard 
+              key={`${item.image.id}-${idx}`}
+              item={item}
+              onContinue={() => onContinueDrawing(item.image, item.focusRegion)}
+            />
           ))}
         </div>
       </div>

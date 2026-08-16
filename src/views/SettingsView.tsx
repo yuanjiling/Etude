@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { motion, AnimatePresence } from 'motion/react';
-import { Check, Copy, FolderOpen, FlipHorizontal, Palette, LayoutGrid, MousePointer2, MoreHorizontal, X, Plus, AlertCircle, ChevronDown, Tag, Trash2 } from 'lucide-react';
+import { Check, Copy, FolderOpen, FlipHorizontal, Palette, LayoutGrid, MousePointer2, MoreHorizontal, X, Plus, AlertCircle, ChevronDown, Tag, Tags, Crosshair, Trash2 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { open } from '@tauri-apps/plugin-dialog';
 import { FocusedPracticeImage } from '../components/FocusedPracticeImage';
+import { ConfirmModal } from '../components/ConfirmModal';
 import type { FocusRegion, ImageRecord } from '../types';
 import { DEFAULT_PRACTICE_SHORTCUTS, formatShortcut, PRACTICE_SHORTCUTS, shortcutFromKeyboardEvent, type PracticeShortcutAction } from '../utils/shortcuts';
 import { BUILTIN_TAG_CATEGORIES, isBuiltinTag, compactVisualTagLabel } from '../utils/tagCatalog';
@@ -91,8 +92,52 @@ const GradientPresetSlider = ({
   );
 };
 
-export const SettingsView = () => {
-  const { settings, updateSettings, history, clearHistory } = useAppContext();
+const HistoryImageCard = React.memo(({
+  item,
+  onPreview,
+  onLocate,
+}: {
+  item: { image: any; focusRegion?: FocusRegion; recordId: string };
+  onPreview: (item: { image: ImageRecord; focusRegion?: FocusRegion }) => void;
+  onLocate?: (imageId: string) => void;
+}) => {
+  return (
+    <div 
+      className="group/hcard relative aspect-[4/5] overflow-hidden rounded-lg bg-zinc-100 dark:bg-zinc-800 shadow-sm transition-shadow hover:shadow-md cursor-pointer select-none"
+      onClick={() => onPreview({ image: item.image, focusRegion: item.focusRegion })}
+    >
+      {item.focusRegion ? (
+        <FocusedPracticeImage image={item.image} region={item.focusRegion} flipped={false} grayscale={false} />
+      ) : (
+        <img
+          src={item.image.thumbnailUrl || item.image.url}
+          className="h-full w-full object-cover pointer-events-none transition-transform duration-200 group-hover/hcard:scale-105"
+          alt=""
+          loading="lazy"
+          decoding="async"
+          draggable={false}
+        />
+      )}
+      <div className="absolute inset-0 bg-black/0 group-hover/hcard:bg-black/15 transition-colors pointer-events-none" />
+      {onLocate && (
+        <button
+          type="button"
+          onClick={event => {
+            event.stopPropagation();
+            onLocate(item.image.id);
+          }}
+          className="absolute top-1 right-1 z-10 flex items-center gap-0.5 rounded-md bg-black/45 px-1.5 py-0.5 text-[8px] font-bold text-white backdrop-blur-sm transition-colors hover:bg-black/65 cursor-pointer"
+          title="定位到图库"
+        >
+          图库 <span aria-hidden>↗</span>
+        </button>
+      )}
+    </div>
+  );
+});
+
+export const SettingsView = ({ onLocateImage }: { onLocateImage?: (imageId: string) => void }) => {
+  const { settings, updateSettings, history, clearHistory, removeTagsFromAllImages, updateLibraryRoot, resetAllImageTags, resetAllImageLocalization, resetAllImageMetadata } = useAppContext();
   const [activeTab, setActiveTab] = useState<'basic' | 'history' | 'library' | 'shortcuts'>('history');
   const [libraryStatus, setLibraryStatus] = useState<LibraryStatus | null>(null);
   const [libraryFileCount, setLibraryFileCount] = useState(0);
@@ -111,6 +156,23 @@ export const SettingsView = () => {
   const [newTagInputs, setNewTagInputs] = useState<Record<string, string>>({});
   const [tagInputErrors, setTagInputErrors] = useState<Record<string, string>>({});
   const [showNativeTags, setShowNativeTags] = useState(false);
+  const [confirmConfig, setConfirmConfig] = useState<{
+    isOpen: boolean;
+    title: string;
+    description: React.ReactNode;
+    confirmText?: string;
+    cancelText?: string;
+    type?: 'danger' | 'warning';
+    onConfirm: () => void;
+  }>({
+    isOpen: false,
+    title: '',
+    description: '',
+    confirmText: '确认',
+    cancelText: '取消',
+    type: 'danger',
+    onConfirm: () => undefined,
+  });
 
   const customGroups = settings.customTagGroups || [];
 
@@ -137,8 +199,24 @@ export const SettingsView = () => {
   };
 
   const handleDeleteGroup = (groupId: string) => {
-    updateSettings({
-      customTagGroups: customGroups.filter(g => g.id !== groupId),
+    const group = customGroups.find(g => g.id === groupId);
+    if (!group) return;
+    setConfirmConfig({
+      isOpen: true,
+      title: '删除标签分组',
+      description: `确定删除分组“${group.name}”吗？该分组下的 ${group.tags.length} 个标签也将从所有图片中移除。此操作无法撤销。`,
+      confirmText: '确认删除',
+      cancelText: '取消',
+      type: 'danger',
+      onConfirm: () => {
+        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        updateSettings({
+          customTagGroups: customGroups.filter(g => g.id !== groupId),
+        });
+        if (group.tags.length) {
+          removeTagsFromAllImages(group.tags);
+        }
+      },
     });
   };
 
@@ -169,10 +247,22 @@ export const SettingsView = () => {
   };
 
   const handleDeleteTagFromGroup = (groupId: string, tagToDelete: string) => {
-    const updatedGroups = customGroups.map(g => (
-      g.id === groupId ? { ...g, tags: g.tags.filter(t => t !== tagToDelete) } : g
-    ));
-    updateSettings({ customTagGroups: updatedGroups });
+    setConfirmConfig({
+      isOpen: true,
+      title: '删除自定义标签',
+      description: `确定删除标签“${tagToDelete}”吗？所有图片上的该标签也将被同步移除。`,
+      confirmText: '确认删除',
+      cancelText: '取消',
+      type: 'danger',
+      onConfirm: () => {
+        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        const updatedGroups = customGroups.map(g => (
+          g.id === groupId ? { ...g, tags: g.tags.filter(t => t !== tagToDelete) } : g
+        ));
+        updateSettings({ customTagGroups: updatedGroups });
+        removeTagsFromAllImages([tagToDelete]);
+      },
+    });
   };
 
   useEffect(() => {
@@ -314,6 +404,7 @@ export const SettingsView = () => {
       setIsCheckingLibrary(true);
       const status = await invoke<LibraryStatus>('set_library_directory', { path: selected });
       setLibraryStatus(status);
+      updateLibraryRoot(status.libraryPath || null);
       const count = await invoke<number>('count_library_images');
       setLibraryFileCount(count);
       setLibraryError(null);
@@ -325,9 +416,49 @@ export const SettingsView = () => {
   };
 
   const handleClearHistory = () => {
-    if (history.length > 0 && window.confirm('清除全部练习记录？此操作无法撤销。')) {
-      clearHistory();
-    }
+    if (history.length === 0) return;
+    setConfirmConfig({
+      isOpen: true,
+      title: '清除全部练习记录',
+      description: `确定清除全部 ${history.length} 条练习历史记录吗？此操作无法撤销。`,
+      confirmText: '清除全部记录',
+      cancelText: '取消',
+      type: 'danger',
+      onConfirm: () => {
+        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        clearHistory();
+      },
+    });
+  };
+
+  const handleResetAllTags = () => {
+    setConfirmConfig({
+      isOpen: true,
+      title: '重置所有标签',
+      description: '将清空所有图片的分类标签，后续需重新打标。此操作无法撤销。',
+      confirmText: '重置所有标签',
+      cancelText: '取消',
+      type: 'warning',
+      onConfirm: () => {
+        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        resetAllImageTags();
+      },
+    });
+  };
+
+  const handleResetAllLocalization = () => {
+    setConfirmConfig({
+      isOpen: true,
+      title: '重置所有定位',
+      description: '将清空所有图片的人物检测与局部定位，后续需重新分析。此操作无法撤销。',
+      confirmText: '重置所有定位',
+      cancelText: '取消',
+      type: 'warning',
+      onConfirm: () => {
+        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        resetAllImageLocalization();
+      },
+    });
   };
 
   useEffect(() => {
@@ -397,6 +528,14 @@ export const SettingsView = () => {
                         onChange={transitionSec => updateSettings({ transitionSec })}
                       />
                     </div>
+                    <div className="flex min-h-9 items-center justify-between pt-1 border-t border-black/5 dark:border-white/5">
+                      <div className="text-xs font-semibold text-stone-800 dark:text-zinc-200">优先抽取未画过的图片</div>
+                      <SettingSwitch
+                        label="优先抽取未画过的图片"
+                        checked={settings.prioritizeUndrawnImages !== false}
+                        onChange={() => updateSettings({ prioritizeUndrawnImages: settings.prioritizeUndrawnImages === false })}
+                      />
+                    </div>
                   </div>
                 </section>
 
@@ -418,13 +557,6 @@ export const SettingsView = () => {
                     <div className="flex min-h-9 items-center justify-between">
                       <div className="text-xs font-semibold text-stone-800 dark:text-zinc-200">启动时置顶</div>
                       <SettingSwitch label="启动时置顶" checked={settings.startAlwaysOnTop} onChange={() => updateSettings({ startAlwaysOnTop: !settings.startAlwaysOnTop })} />
-                    </div>
-                    <div className="flex min-h-9 items-center justify-between">
-                      <div>
-                        <div className="text-xs font-semibold text-stone-800 dark:text-zinc-200">记住练习窗口位置和尺寸</div>
-                        <div className="mt-0.5 text-[8px] text-stone-400">下次启动沿用上次窗口布局</div>
-                      </div>
-                      <SettingSwitch label="记住练习窗口位置和尺寸" checked={settings.rememberWindowBounds} onChange={() => updateSettings({ rememberWindowBounds: !settings.rememberWindowBounds })} />
                     </div>
                   </div>
                 </section>
@@ -606,6 +738,30 @@ export const SettingsView = () => {
                   </div>
                 </section>
 
+                <div className="grid grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={handleResetAllTags}
+                    className="group relative flex items-center justify-center gap-2 h-10 px-3 rounded-xl border border-black/5 dark:border-white/5 bg-black/[0.02] dark:bg-white/[0.03] hover:bg-black/[0.05] dark:hover:bg-white/[0.06] hover:border-black/10 dark:hover:border-white/10 active:scale-[0.98] transition-all cursor-pointer"
+                  >
+                    <div className="w-6 h-6 rounded-lg bg-black/5 dark:bg-white/5 flex items-center justify-center text-stone-600 dark:text-zinc-300 group-hover:text-stone-900 dark:group-hover:text-white transition-colors shrink-0">
+                      <Tags size={13} />
+                    </div>
+                    <span className="text-[11px] font-bold text-stone-800 dark:text-zinc-200">重置所有标签</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleResetAllLocalization}
+                    className="group relative flex items-center justify-center gap-2 h-10 px-3 rounded-xl border border-black/5 dark:border-white/5 bg-black/[0.02] dark:bg-white/[0.03] hover:bg-black/[0.05] dark:hover:bg-white/[0.06] hover:border-black/10 dark:hover:border-white/10 active:scale-[0.98] transition-all cursor-pointer"
+                  >
+                    <div className="w-6 h-6 rounded-lg bg-black/5 dark:bg-white/5 flex items-center justify-center text-stone-600 dark:text-zinc-300 group-hover:text-stone-900 dark:group-hover:text-white transition-colors shrink-0">
+                      <Crosshair size={13} />
+                    </div>
+                    <span className="text-[11px] font-bold text-stone-800 dark:text-zinc-200">重置所有定位</span>
+                  </button>
+                </div>
+
                 <div className="mt-auto pt-4 text-center text-[8px] leading-relaxed text-stone-400 dark:text-zinc-600">
                   <div className="font-semibold">画谱 Etude</div>
                   <div>Version {appVersion}</div>
@@ -656,16 +812,12 @@ export const SettingsView = () => {
                         </div>
                         <div className="grid grid-cols-[repeat(auto-fill,minmax(92px,1fr))] gap-2">
                           {visibleItems.map((item, i) => (
-                            <div 
-                              key={`${item.recordId}-${i}`} 
-                              className="group relative aspect-[4/5] overflow-hidden rounded-lg bg-zinc-100 shadow-sm transition-shadow hover:shadow-md dark:bg-zinc-800"
-                              onClick={() => setSelectedItem({ image: item.image, focusRegion: item.focusRegion })}
-                            >
-                              {item.focusRegion
-                                ? <FocusedPracticeImage image={item.image} region={item.focusRegion} flipped={false} grayscale={false} />
-                                : <img src={item.image.url} className="h-full w-full object-cover" alt="" loading="lazy" draggable={false} />}
-                              <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors pointer-events-none"></div>
-                            </div>
+                            <HistoryImageCard
+                              key={`${item.recordId}-${i}`}
+                              item={item}
+                              onPreview={setSelectedItem}
+                              onLocate={onLocateImage}
+                            />
                           ))}
                         </div>
                         {group.items.length > 6 && (
@@ -958,6 +1110,17 @@ export const SettingsView = () => {
           </motion.div>
         )}
       </AnimatePresence>
+
+      <ConfirmModal
+        isOpen={confirmConfig.isOpen}
+        title={confirmConfig.title}
+        description={confirmConfig.description}
+        confirmText={confirmConfig.confirmText}
+        cancelText={confirmConfig.cancelText}
+        type={confirmConfig.type}
+        onConfirm={confirmConfig.onConfirm}
+        onCancel={() => setConfirmConfig(prev => ({ ...prev, isOpen: false }))}
+      />
     </div>
   );
 };

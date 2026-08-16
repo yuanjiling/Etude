@@ -1,9 +1,17 @@
 import type { ObjectDetector } from '@mediapipe/tasks-vision';
-import type { ContentRoutingAnalysis, PersonDetectionBox, PoseAnalysis, VisualAnalysis } from '../types';
-import { analyzePoseFocus } from './poseFocus';
+import type { ContentRoutingAnalysis, ImageRecord, PersonDetectionBox, PoseAnalysis, VisualAnalysis } from '../types';
+import { analyzePoseFocus, POSE_MODEL_VERSION } from './poseFocus';
 
 export const CONTENT_ROUTER_VERSION = 'mediapipe-efficientdet-lite0-rules-v1';
 export const VISUAL_ANALYSIS_VERSION = 'canvas-lab-lightness-aspect-v3';
+
+export const isAnalysisComplete = (image: ImageRecord): boolean => {
+  if (!image.contentRouting || image.contentRouting.modelVersion !== CONTENT_ROUTER_VERSION) return false;
+  if (image.contentRouting.scope === 'general_reference') {
+    return image.visualAnalysis?.modelVersion === VISUAL_ANALYSIS_VERSION;
+  }
+  return image.poseAnalysis?.modelVersion === POSE_MODEL_VERSION;
+};
 
 const PERSON_SCORE_THRESHOLD = 0.35;
 const MAX_INFERENCE_EDGE = 1440;

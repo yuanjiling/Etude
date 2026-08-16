@@ -95,6 +95,10 @@ static PRACTICE_LOCKED: once_cell::sync::Lazy<AtomicBool> =
     once_cell::sync::Lazy::new(|| AtomicBool::new(false));
 static LOCK_MONITOR_GENERATION: once_cell::sync::Lazy<AtomicU64> =
     once_cell::sync::Lazy::new(|| AtomicU64::new(0));
+static SHUTTING_DOWN: once_cell::sync::Lazy<AtomicBool> =
+    once_cell::sync::Lazy::new(|| AtomicBool::new(false));
+static STOP_TAGGING: once_cell::sync::Lazy<AtomicBool> =
+    once_cell::sync::Lazy::new(|| AtomicBool::new(false));
 
 fn apply_practice_lock(window: &tauri::Window, locked: bool) {
     PRACTICE_LOCKED.store(locked, Ordering::SeqCst);
@@ -288,8 +292,12 @@ fn get_tagger_dir(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let executable_dir = executable
         .parent()
         .ok_or_else(|| "无法确定软件所在目录".to_string())?;
-    let path = executable_dir.join("model").join("tagger-component");
-    Ok(path)
+    let model = executable_dir.join("model");
+    let v2 = model.join("tagger-component-v2");
+    if v2.exists() {
+        return Ok(v2);
+    }
+    Ok(model.join("tagger-component"))
 }
 
 fn python_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
@@ -370,6 +378,8 @@ fn tagging_runtime_installed(app: &tauri::AppHandle) -> bool {
 fn find_tagging_model(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let root = get_tagger_dir(app)?;
     let candidates = vec![
+        root.join("model/photo_tagger_visual_fp16_v2"),
+        root.join("photo_tagger_visual_fp16_v2"),
         root.join("model/photo_tagger_visual_fp16_v1"),
         root.join("photo_tagger_visual_fp16_v1"),
         root.clone(),
@@ -378,6 +388,7 @@ fn find_tagging_model(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let candidates = {
         let mut candidates = candidates;
         if let Ok(current_dir) = std::env::current_dir() {
+            candidates.push(current_dir.join("assets/model/photo_tagger_visual_fp16_v2"));
             candidates.push(current_dir.join("assets/model/photo_tagger_visual_fp16_v1"));
         }
         candidates
@@ -693,6 +704,24 @@ fn remove_library_image(app: tauri::AppHandle, image_path: String) -> Result<(),
     Ok(())
 }
 
+#[tauri::command]
+fn remove_library_images(app: tauri::AppHandle, image_paths: Vec<String>) -> Result<(), String> {
+    let library_dir = get_library_dir(&app)?
+        .canonicalize()
+        .map_err(|error| format!("无法读取图库目录：{error}"))?;
+    let cache_dir = thumbnail_cache_dir(&app)?;
+    for image_path in image_paths {
+        if let Ok(image) = PathBuf::from(&image_path).canonicalize() {
+            if image.starts_with(&library_dir) && image.is_file() && is_supported_image(&image) {
+                let thumbnail = thumbnail_path_for(&image, &cache_dir);
+                let _ = fs::remove_file(&image);
+                let _ = fs::remove_file(thumbnail);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn import_library_files(
     app: &tauri::AppHandle,
     source_paths: Vec<String>,
@@ -803,6 +832,7 @@ async fn auto_tag_images(
     image_paths: Vec<String>,
     on_progress: Channel<serde_json::Value>,
 ) -> Result<Vec<serde_json::Value>, String> {
+    STOP_TAGGING.store(false, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir().join(format!(
         "etude_tagging_{}",
         std::time::SystemTime::now()
@@ -844,7 +874,13 @@ async fn auto_tag_images(
 
     let stdout = child.stdout.take().ok_or("无法读取打标进程输出")?;
     let reader = BufReader::new(stdout);
+    let mut aborted = false;
     for line in reader.lines() {
+        if SHUTTING_DOWN.load(Ordering::SeqCst) || STOP_TAGGING.load(Ordering::SeqCst) {
+            aborted = true;
+            let _ = child.kill();
+            break;
+        }
         if let Ok(l) = line {
             if let Ok(progress) = serde_json::from_str::<serde_json::Value>(&l) {
                 if progress.get("type").and_then(|t| t.as_str()) == Some("progress") {
@@ -852,6 +888,11 @@ async fn auto_tag_images(
                 }
             }
         }
+    }
+    if aborted {
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err("已停止自动打标".into());
     }
 
     let stderr = child
@@ -885,7 +926,20 @@ async fn auto_tag_images(
 }
 
 #[tauri::command]
+fn begin_shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    LOCK_MONITOR_ACTIVE.store(false, Ordering::SeqCst);
+    LOCK_MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn stop_tagging() {
+    STOP_TAGGING.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
 fn exit_app(app: tauri::AppHandle) {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
     LOCK_MONITOR_ACTIVE.store(false, Ordering::SeqCst);
     LOCK_MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
     app.exit(0);
@@ -897,6 +951,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_native_drag,
             set_window_click_through,
+            begin_shutdown,
+            stop_tagging,
             exit_app,
             database::read_app_state,
             database::write_app_state,
@@ -906,6 +962,7 @@ pub fn run() {
             count_library_images,
             get_library_thumbnail,
             remove_library_image,
+            remove_library_images,
             import_library_paths,
             open_library_folder,
             open_tagger_folder,

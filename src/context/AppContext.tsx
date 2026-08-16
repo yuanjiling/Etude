@@ -2,7 +2,7 @@ import React, { createContext, useContext, useState, useEffect, useRef } from 'r
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { ImageRecord, PracticeSet, HistoryRecord, PracticeConfig, AppSettings, CustomTagGroup } from '../types';
 import { INITIAL_SETS } from '../data';
-import { analyzeContent, visualAnalysisTags } from '../services/contentAnalysis';
+import { analyzeContent, isAnalysisComplete, visualAnalysisTags } from '../services/contentAnalysis';
 import { mapModelTags } from '../utils/modelTags';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { isTauriEnvironment } from '../utils/tauriWindow';
@@ -19,6 +19,7 @@ export type LibraryTaskState = {
 
 interface AppState {
   images: ImageRecord[];
+  libraryRoot: string | null;
   sets: PracticeSet[];
   history: HistoryRecord[];
   darkMode: boolean;
@@ -31,8 +32,14 @@ interface AppState {
   toggleImageHidden: (id: string) => void;
   addImages: (newImgs: ImageRecord[]) => void;
   upsertImages: (newImgs: ImageRecord[]) => void;
-  syncLibraryImages: (libraryImages: ImageRecord[]) => void;
+  syncLibraryImages: (scannedImages: ImageRecord[]) => void;
+  updateLibraryRoot: (root: string | null) => void;
+  removeTagsFromAllImages: (tags: string[]) => void;
+  resetAllImageTags: () => void;
+  resetAllImageLocalization: () => void;
+  resetAllImageMetadata: () => void;
   removeImage: (id: string) => void;
+  removeImages: (ids: string[]) => void;
   saveSet: (set: PracticeSet) => void;
   deleteSet: (id: string) => void;
   addHistory: (record: HistoryRecord) => void;
@@ -41,6 +48,8 @@ interface AppState {
   localizationTask: LibraryTaskState;
   startImageTagging: (targets: ImageRecord[]) => Promise<void>;
   startImageLocalization: (targets: ImageRecord[]) => Promise<void>;
+  stopImageTagging: () => void;
+  stopImageLocalization: () => void;
 }
 
 const AppContext = createContext<AppState | null>(null);
@@ -67,11 +76,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   flipAnimation: true,
   libraryThumbnailWidth: 174,
   startAlwaysOnTop: false,
-  rememberWindowBounds: true,
-  windowBounds: undefined,
   shortcuts: DEFAULT_PRACTICE_SHORTCUTS,
   customTagGroups: [],
   customTags: [],
+  practiceContentTypes: undefined,
+  prioritizeUndrawnImages: true,
 };
 
 const loadSettings = (stored: unknown): AppSettings => {
@@ -112,23 +121,64 @@ const imageRecordsEqual = (left: ImageRecord, right: ImageRecord) => {
   return Array.from(keys).every(key => left[key] === right[key]);
 };
 
+const normalizePathForCompare = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+
+const isPathUnderRoot = (path: string, root: string) => {
+  const normalizedPath = normalizePathForCompare(path);
+  const normalizedRoot = normalizePathForCompare(root);
+  if (!normalizedRoot) return false;
+  return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
+};
+
+type AnalysisUpdateItem = {
+  target: ImageRecord;
+  patch: Partial<ImageRecord>;
+  expectedScope?: string;
+};
+
+const applyAnalysisPatch = (images: ImageRecord[], updates: AnalysisUpdateItem[]): ImageRecord[] => {
+  if (updates.length === 0) return images;
+  const patchByPath = new Map<string, { patch: Partial<ImageRecord>; expectedScope?: string }>();
+  const patchById = new Map<string, { patch: Partial<ImageRecord>; expectedScope?: string }>();
+  for (const update of updates) {
+    const scope = update.expectedScope ?? update.target.contentRouting?.scope;
+    if (update.target.sourcePath) patchByPath.set(update.target.sourcePath, { patch: update.patch, expectedScope: scope });
+    if (update.target.id) patchById.set(update.target.id, { patch: update.patch, expectedScope: scope });
+  }
+  return images.map(image => {
+    const match = (image.sourcePath && patchByPath.get(image.sourcePath)) || patchById.get(image.id);
+    if (!match) return image;
+    if (match.expectedScope && image.contentRouting?.scope && image.contentRouting.scope !== match.expectedScope) {
+      return image;
+    }
+    return { ...image, ...match.patch };
+  });
+};
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [isLoaded, setIsLoaded] = useState(false);
   const [images, setImages] = useState<ImageRecord[]>([]);
+  const [archivedImages, setArchivedImages] = useState<ImageRecord[]>([]);
   const [sets, setSets] = useState<PracticeSet[]>([]);
   const [history, setHistory] = useState<HistoryRecord[]>([]);
   const [darkMode, setDarkMode] = useState<boolean>(false);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [libraryRoot, setLibraryRoot] = useState<string | null>(null);
   const [taggingTask, setTaggingTask] = useState<LibraryTaskState>({ running: false, current: 0, total: 0 });
   const [localizationTask, setLocalizationTask] = useState<LibraryTaskState>({ running: false, current: 0, total: 0 });
   const taggingRunningRef = useRef(false);
   const localizationRunningRef = useRef(false);
+  const cancelTaggingRef = useRef(false);
+  const cancelLocalizationRef = useRef(false);
   const lastUiInteractionRef = useRef(0);
   const persistenceEnabledRef = useRef(false);
-  const latestStateRef = useRef({ images, sets, history, settings });
-  latestStateRef.current = { images, sets, history, settings };
+  const latestStateRef = useRef({ images, archivedImages, sets, history, settings });
+  latestStateRef.current = { images, archivedImages, sets, history, settings };
   const saveTimeoutRef = useRef<number | null>(null);
   const lastSaveTimeRef = useRef<number>(Date.now());
+  const shuttingDownRef = useRef(false);
+  const pendingAnalysisUpdatesRef = useRef<AnalysisUpdateItem[]>([]);
+  const flushAnalysisUpdatesRef = useRef<() => void>(() => undefined);
 
   useEffect(() => {
     const markInteraction = () => { lastUiInteractionRef.current = performance.now(); };
@@ -147,7 +197,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const latest = latestStateRef.current;
     try {
       await invoke('write_app_state', {
-        data: JSON.stringify({ images: latest.images, sets: latest.sets, history: latest.history }),
+        data: JSON.stringify({ images: [...latest.images, ...latest.archivedImages], sets: latest.sets, history: latest.history }),
       });
     } catch (err) {
       console.warn('Failed to save app state to SQLite:', err);
@@ -157,6 +207,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Load Data
   useEffect(() => {
     const loadData = async () => {
+      let allImages: ImageRecord[] = [];
+      let root: string | null = null;
       try {
         const [json, settingsJson] = await Promise.all([
           invoke<string>('read_app_state'),
@@ -164,8 +216,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ]);
         if (json && json !== '{}') {
           const data = JSON.parse(json);
-          if (data.images) setImages(data.images);
-          else setImages([]);
+          if (Array.isArray(data.images)) allImages = data.images;
 
           if (data.sets && Array.isArray(data.sets)) {
             const hasOldDefault = data.sets.some((s: any) => (s.id === 's1' && s.name === '动态热身') || (s.id === 's2' && s.name === '头像速写'));
@@ -180,15 +231,30 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
           if (data.history) setHistory(data.history);
         } else {
-          setImages([]);
           setSets(INITIAL_SETS);
         }
         setSettings(loadSettings(settingsJson && settingsJson !== '{}' ? JSON.parse(settingsJson) : undefined));
+
+        try {
+          const status = await invoke<{ libraryPath?: string } | null>('get_library_status');
+          root = status?.libraryPath || null;
+        } catch {
+          root = null;
+        }
       } catch (err) {
         console.warn('Failed to load data from Tauri:', err);
-        setImages([]);
+        allImages = [];
         setSets(INITIAL_SETS);
       } finally {
+        const examples = allImages.filter(image => !image.sourcePath);
+        const sourceImages = allImages.filter(image => Boolean(image.sourcePath));
+        setImages(root
+          ? [...examples, ...sourceImages.filter(image => isPathUnderRoot(image.sourcePath!, root!))]
+          : allImages);
+        setArchivedImages(root
+          ? sourceImages.filter(image => !isPathUnderRoot(image.sourcePath!, root!))
+          : []);
+        setLibraryRoot(root);
         persistenceEnabledRef.current = true;
         setIsLoaded(true);
       }
@@ -220,7 +286,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         window.clearTimeout(saveTimeoutRef.current);
       }
     };
-  }, [images, sets, history, isLoaded]);
+  }, [images, archivedImages, sets, history, isLoaded]);
 
   // Settings are intentionally independent from the library database.
   useEffect(() => {
@@ -247,11 +313,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
       event.preventDefault();
       isClosing = true;
+      // Stop the background tasks from starting new images and hide the window instantly.
+      shuttingDownRef.current = true;
+      void invoke('begin_shutdown').catch(() => undefined);
+      appWindow.hide().catch(() => undefined);
+      // Flush any results that were already produced but still buffered.
+      flushAnalysisUpdatesRef.current();
       const latest = latestStateRef.current;
       try {
         await Promise.race([
           Promise.all([
-            invoke('write_app_state', { data: JSON.stringify({ images: latest.images, sets: latest.sets, history: latest.history }) }),
+            invoke('write_app_state', { data: JSON.stringify({ images: [...latest.images, ...latest.archivedImages], sets: latest.sets, history: latest.history }) }),
             invoke('write_settings', { data: JSON.stringify(latest.settings) }),
           ]),
           new Promise(resolve => setTimeout(resolve, 1000)),
@@ -297,10 +369,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setImages(prev => prev.map(img => img.id === id ? { ...img, tags } : img));
   };
 
-  const updateImageThumbnail = (id: string, thumbnailUrl?: string) => {
-    setImages(prev => prev.map(img => (
-      img.id === id && img.thumbnailUrl !== thumbnailUrl ? { ...img, thumbnailUrl } : img
-    )));
+  const updateImageThumbnail = (_id: string, _thumbnailUrl?: string) => {
+    // Thumbnails are cached on disk by the Rust thumbnail cache and are re-attached by the
+    // next library scan. Deliberately do NOT mutate `images` here: writing a thumbnail URL
+    // into the image record used to force the whole gallery (displayItems + justified layout
+    // + Virtuoso) to recompute for every single thumbnail completion, which froze the UI
+    // while many thumbnails streamed in.
   };
 
   const toggleImageFavorite = (id: string) => {
@@ -309,6 +383,72 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const toggleImageHidden = (id: string) => {
     setImages(prev => prev.map(img => img.id === id ? { ...img, hidden: !img.hidden } : img));
+  };
+
+  const updateLibraryRoot = (root: string | null) => {
+    const current = latestStateRef.current;
+    const examples = current.images.filter(image => !image.sourcePath);
+    const sourceByPath = new Map<string, ImageRecord>();
+    [...current.images.filter(image => Boolean(image.sourcePath)), ...current.archivedImages].forEach(image => {
+      if (image.sourcePath) sourceByPath.set(normalizePathForCompare(image.sourcePath), image);
+    });
+    const allSource = Array.from(sourceByPath.values());
+    const nextImages = [...examples];
+    const nextArchived: ImageRecord[] = [];
+    allSource.forEach(image => {
+      if (root && image.sourcePath && isPathUnderRoot(image.sourcePath, root)) {
+        nextImages.push(image);
+      } else {
+        nextArchived.push(image);
+      }
+    });
+    setImages(nextImages);
+    setArchivedImages(nextArchived);
+    setLibraryRoot(root);
+  };
+
+  const mapAllImages = (mapper: (image: ImageRecord) => ImageRecord) => {
+    setImages(prev => prev.map(mapper));
+    setArchivedImages(prev => prev.map(mapper));
+  };
+
+  const removeTagsFromAllImages = (tags: string[]) => {
+    const toRemove = new Set(tags.filter(tag => Boolean(tag)));
+    if (toRemove.size === 0) return;
+    mapAllImages(image => {
+      if (!image.tags.some(tag => toRemove.has(tag))) return image;
+      return { ...image, tags: image.tags.filter(tag => !toRemove.has(tag)) };
+    });
+  };
+
+  const resetAllImageTags = () => {
+    mapAllImages(image => ({
+      ...image,
+      tags: [],
+      tagStatus: 'pending',
+      tagError: undefined,
+    }));
+  };
+
+  const resetAllImageLocalization = () => {
+    mapAllImages(image => ({
+      ...image,
+      poseAnalysis: undefined,
+      contentRouting: undefined,
+      visualAnalysis: undefined,
+    }));
+  };
+
+  const resetAllImageMetadata = () => {
+    mapAllImages(image => ({
+      ...image,
+      tags: [],
+      tagStatus: 'pending',
+      tagError: undefined,
+      poseAnalysis: undefined,
+      contentRouting: undefined,
+      visualAnalysis: undefined,
+    }));
   };
 
   const addImages = (newImgs: ImageRecord[]) => {
@@ -329,30 +469,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
   };
 
-  type AnalysisUpdateItem = {
-    target: ImageRecord;
-    patch: Partial<ImageRecord>;
-    expectedScope?: string;
-  };
-
   const updateImagesAnalysisBatch = (updates: AnalysisUpdateItem[]) => {
     if (updates.length === 0) return;
-    const patchByPath = new Map<string, { patch: Partial<ImageRecord>; expectedScope?: string }>();
-    const patchById = new Map<string, { patch: Partial<ImageRecord>; expectedScope?: string }>();
-    for (const update of updates) {
-      const scope = update.expectedScope ?? update.target.contentRouting?.scope;
-      if (update.target.sourcePath) patchByPath.set(update.target.sourcePath, { patch: update.patch, expectedScope: scope });
-      if (update.target.id) patchById.set(update.target.id, { patch: update.patch, expectedScope: scope });
-    }
-    setImages(current => current.map(image => {
-      const match = (image.sourcePath && patchByPath.get(image.sourcePath)) || patchById.get(image.id);
-      if (!match) return image;
-      if (match.expectedScope && image.contentRouting?.scope && image.contentRouting.scope !== match.expectedScope) {
-        return image;
-      }
-      return { ...image, ...match.patch };
-    }));
+    const next = applyAnalysisPatch(latestStateRef.current.images, updates);
+    latestStateRef.current = { ...latestStateRef.current, images: next };
+    setImages(next);
   };
+
+  const flushAnalysisUpdates = () => {
+    if (pendingAnalysisUpdatesRef.current.length === 0) return;
+    const batch = pendingAnalysisUpdatesRef.current.splice(0, pendingAnalysisUpdatesRef.current.length);
+    updateImagesAnalysisBatch(batch);
+  };
+  flushAnalysisUpdatesRef.current = flushAnalysisUpdates;
 
   const updateImageAnalysis = (
     target: ImageRecord,
@@ -368,22 +497,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     ));
     if (taggingRunningRef.current || queue.length === 0) return;
     taggingRunningRef.current = true;
+    cancelTaggingRef.current = false;
     setTaggingTask({ running: true, current: 0, total: queue.length });
     const applied = new Set<number>();
-    const bufferedUpdates: AnalysisUpdateItem[] = [];
     let lastFlushTime = Date.now();
     let lastTaskTime = 0;
-
-    const flushBatch = () => {
-      if (bufferedUpdates.length === 0) return;
-      const batch = bufferedUpdates.splice(0, bufferedUpdates.length);
-      updateImagesAnalysisBatch(batch);
-      lastFlushTime = Date.now();
-    };
 
     try {
       const progress = new Channel<Record<string, unknown>>();
       progress.onmessage = message => {
+        if (cancelTaggingRef.current) return;
         const current = Number(message.current) || 0;
         const now = Date.now();
         if (now - lastTaskTime >= 120 || current === queue.length) {
@@ -393,7 +516,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (current < 1 || current > queue.length || !message.result) return;
         const index = current - 1;
         applied.add(index);
-        bufferedUpdates.push({
+        pendingAnalysisUpdatesRef.current.push({
           target: queue[index],
           patch: {
             tags: mapModelTags(message.result),
@@ -402,8 +525,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           },
           expectedScope: 'human_dominant',
         });
-        if (bufferedUpdates.length >= 5 || now - lastFlushTime >= 200) {
-          flushBatch();
+        if (pendingAnalysisUpdatesRef.current.length >= 5 || now - lastFlushTime >= 200) {
+          flushAnalysisUpdates();
+          lastFlushTime = now;
         }
       };
       const results = await invoke<unknown[]>('auto_tag_images', {
@@ -412,7 +536,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
       results.forEach((result, index) => {
         if (applied.has(index) || !queue[index]) return;
-        bufferedUpdates.push({
+        pendingAnalysisUpdatesRef.current.push({
           target: queue[index],
           patch: {
             tags: mapModelTags(result),
@@ -422,7 +546,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           expectedScope: 'human_dominant',
         });
       });
-      flushBatch();
+      flushAnalysisUpdates();
       void flushSave();
       setTaggingTask({
         running: false,
@@ -431,37 +555,38 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         message: `已完成 ${results.length} 张图片的自动打标`,
       });
     } catch (error) {
-      flushBatch();
+      flushAnalysisUpdates();
       void flushSave();
-      console.warn('Background tagging failed:', error);
-      setTaggingTask(current => ({ ...current, running: false, error: String(error) }));
+      if (cancelTaggingRef.current) {
+        setTaggingTask(current => ({ ...current, running: false, message: '已停止自动打标' }));
+      } else {
+        console.warn('Background tagging failed:', error);
+        setTaggingTask(current => ({ ...current, running: false, error: String(error) }));
+      }
     } finally {
       taggingRunningRef.current = false;
     }
   };
 
   const startImageLocalization = async (targets: ImageRecord[]) => {
-    const queue = targets.filter(image => Boolean(image.sourcePath));
+    const queue = targets.filter(image => Boolean(image.sourcePath) && !isAnalysisComplete(image));
     if (localizationRunningRef.current || queue.length === 0) return;
     localizationRunningRef.current = true;
+    cancelLocalizationRef.current = false;
     setThumbnailSchedulerPaused(true);
     setLocalizationTask({ running: true, current: 0, total: queue.length });
     let completed = 0;
     let failed = 0;
     let regionCount = 0;
-    const bufferedUpdates: AnalysisUpdateItem[] = [];
     let lastFlushTime = Date.now();
     let lastTaskTime = 0;
 
-    const flushBatch = () => {
-      if (bufferedUpdates.length === 0) return;
-      const batch = bufferedUpdates.splice(0, bufferedUpdates.length);
-      updateImagesAnalysisBatch(batch);
-      lastFlushTime = Date.now();
-    };
-
     const waitForAnalysisSlot = () => new Promise<void>(resolve => {
       const waitUntilQuiet = () => {
+        if (shuttingDownRef.current || cancelLocalizationRef.current) {
+          resolve();
+          return;
+        }
         const quietFor = performance.now() - lastUiInteractionRef.current;
         if (quietFor < 120) {
           globalThis.setTimeout(waitUntilQuiet, Math.ceil(120 - quietFor));
@@ -482,7 +607,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     try {
       for (const image of queue) {
+        if (shuttingDownRef.current || cancelLocalizationRef.current) break;
         await waitForAnalysisSlot();
+        if (shuttingDownRef.current || cancelLocalizationRef.current) break;
         try {
           const analysis = await analyzeContent(image.url);
           const contentRouting = image.contentRouting?.manuallyCorrected
@@ -504,7 +631,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             patch.poseAnalysis = analysis.poseAnalysis;
             patch.visualAnalysis = undefined;
           }
-          bufferedUpdates.push({ target: image, patch, expectedScope: contentRouting.scope });
+          pendingAnalysisUpdatesRef.current.push({ target: image, patch, expectedScope: contentRouting.scope });
           completed += 1;
           regionCount += analysis.poseAnalysis.regions.length;
         } catch (error) {
@@ -513,8 +640,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
 
         const now = Date.now();
-        if (bufferedUpdates.length >= 5 || now - lastFlushTime >= 200) {
-          flushBatch();
+        if (pendingAnalysisUpdatesRef.current.length >= 5 || now - lastFlushTime >= 200) {
+          flushAnalysisUpdates();
+          lastFlushTime = now;
         }
         if (now - lastTaskTime >= 120 || (completed + failed) === queue.length) {
           lastTaskTime = now;
@@ -524,29 +652,44 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         // Yield to the main browser thread to allow UI rendering and smooth user interaction
         await new Promise<void>(resolve => setTimeout(resolve, taggingRunningRef.current ? 48 : 12));
       }
-      flushBatch();
+      flushAnalysisUpdates();
       void flushSave();
-      setLocalizationTask({
-        running: false,
-        current: queue.length,
-        total: queue.length,
-        message: `已分析 ${completed} 张图片，生成 ${regionCount} 个虚拟局部${failed > 0 ? `，${failed} 张失败` : ''}`,
-      });
+      if (!shuttingDownRef.current) {
+        setLocalizationTask({
+          running: false,
+          current: completed + failed,
+          total: queue.length,
+          message: cancelLocalizationRef.current
+            ? `已停止素材分析（完成 ${completed} 张${failed > 0 ? `，${failed} 张失败` : ''}）`
+            : `已分析 ${completed} 张图片，生成 ${regionCount} 个虚拟局部${failed > 0 ? `，${failed} 张失败` : ''}`,
+        });
+      }
     } catch (error) {
-      flushBatch();
+      flushAnalysisUpdates();
       void flushSave();
       console.warn('Localization task failed:', error);
-      setLocalizationTask(current => ({ ...current, running: false, error: String(error) }));
+      if (!shuttingDownRef.current) {
+        setLocalizationTask(current => ({ ...current, running: false, error: String(error) }));
+      }
     } finally {
       localizationRunningRef.current = false;
       setThumbnailSchedulerPaused(false);
     }
   };
 
-  const syncLibraryImages = (libraryImages: ImageRecord[]) => {
+  const stopImageTagging = () => {
+    cancelTaggingRef.current = true;
+    void invoke('stop_tagging').catch(() => undefined);
+  };
+
+  const stopImageLocalization = () => {
+    cancelLocalizationRef.current = true;
+  };
+
+  const syncLibraryImages = (scannedImages: ImageRecord[]) => {
     setImages(prev => {
       const next = [
-        ...libraryImages,
+        ...scannedImages,
         ...prev.filter(image => !image.sourcePath),
       ];
       if (prev.length === next.length && prev.every((image, index) => imageRecordsEqual(image, next[index]))) {
@@ -558,6 +701,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const removeImage = (id: string) => {
     setImages(prev => prev.filter(image => image.id !== id));
+  };
+
+  const removeImages = (ids: string[]) => {
+    if (ids.length === 0) return;
+    const idSet = new Set(ids);
+    setImages(prev => prev.filter(image => !idSet.has(image.id)));
   };
 
   const saveSet = (set: PracticeSet) => {
@@ -600,10 +749,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   return (
     <AppContext.Provider value={{
-      images, sets, history, darkMode, toggleDarkMode,
+      images, libraryRoot, sets, history, darkMode, toggleDarkMode,
       settings, updateSettings,
-      updateImageTags, updateImageThumbnail, toggleImageFavorite, toggleImageHidden, addImages, upsertImages, syncLibraryImages, removeImage, saveSet, deleteSet, addHistory, clearHistory,
-      taggingTask, localizationTask, startImageTagging, startImageLocalization,
+      updateImageTags, updateImageThumbnail, toggleImageFavorite, toggleImageHidden, addImages, upsertImages, syncLibraryImages, updateLibraryRoot, removeTagsFromAllImages, resetAllImageTags, resetAllImageLocalization, resetAllImageMetadata, removeImage, removeImages, saveSet, deleteSet, addHistory, clearHistory,
+      taggingTask, localizationTask, startImageTagging, startImageLocalization, stopImageTagging, stopImageLocalization,
     }}>
       {children}
     </AppContext.Provider>

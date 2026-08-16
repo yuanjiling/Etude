@@ -7,10 +7,11 @@ const StageItem: React.FC<{
   stage: StageConfig;
   idx: number;
   isActive: boolean;
+  removable: boolean;
   onSelectStage?: (idx: number | null) => void;
   updateStage: (idx: number, field: keyof StageConfig, val: any) => void;
   removeStage: (idx: number, e: React.MouseEvent) => void;
-}> = ({ stage, idx, isActive, onSelectStage, updateStage, removeStage }) => {
+}> = ({ stage, idx, isActive, removable, onSelectStage, updateStage, removeStage }) => {
   const dragControls = useDragControls();
   const allTags = [...(stage.includeTags || []), ...(stage.excludeTags || [])];
 
@@ -23,7 +24,7 @@ const StageItem: React.FC<{
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, scale: 0.95 }}
-      onClick={() => onSelectStage && onSelectStage(isActive ? null : idx)}
+      onClick={() => onSelectStage && onSelectStage(idx)}
       className={`
         flex flex-col gap-1.5 p-2 pl-8 rounded-lg relative group cursor-pointer
         transition-all duration-300
@@ -101,17 +102,19 @@ const StageItem: React.FC<{
         </div>
       </div>
 
-      <button 
-        onClick={(e) => removeStage(idx, e)}
-        onPointerDown={e => e.stopPropagation()}
-        className={`
-          absolute top-1.5 right-1.5 w-6 h-6 flex items-center justify-center rounded-md transition-colors
-          ${isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}
-          text-stone-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10
-        `}
-      >
-        <X size={12} />
-      </button>
+      {removable && (
+        <button 
+          onClick={(e) => removeStage(idx, e)}
+          onPointerDown={e => e.stopPropagation()}
+          className={`
+            absolute top-1.5 right-1.5 w-6 h-6 flex items-center justify-center rounded-md transition-colors
+            ${isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}
+            text-stone-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10
+          `}
+        >
+          <X size={12} />
+        </button>
+      )}
     </Reorder.Item>
   );
 };
@@ -138,11 +141,12 @@ export const StageEditor: React.FC<{
 
   const removeStage = (idx: number, e: React.MouseEvent) => {
     e.stopPropagation();
+    if (stages.length <= 1) return;
     const newStages = [...stages];
     newStages.splice(idx, 1);
     onChange(newStages);
     if (activeStageIdx === idx && onSelectStage) {
-      onSelectStage(newStages.length > 0 ? Math.min(idx, newStages.length - 1) : null);
+      onSelectStage(Math.min(idx, newStages.length - 1));
     } else if (activeStageIdx !== null && activeStageIdx > idx && onSelectStage) {
       onSelectStage(activeStageIdx - 1);
     }
@@ -185,6 +189,7 @@ export const StageEditor: React.FC<{
             stage={stage}
             idx={idx}
             isActive={activeStageIdx === idx}
+            removable={stagesWithIds.length > 1}
             onSelectStage={onSelectStage}
             updateStage={updateStage}
             removeStage={removeStage}

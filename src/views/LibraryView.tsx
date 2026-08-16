@@ -1,17 +1,20 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { Virtuoso } from 'react-virtuoso';
-import { Check, ChevronDown, ChevronRight, Crosshair, Folder, FolderOpen, FolderTree, ImagePlus, Loader2, Minus, Pencil, Play, Plus, RefreshCw, Tags, Trash2, X } from 'lucide-react';
+import type { VirtuosoHandle } from 'react-virtuoso';
+import { Check, ChevronDown, ChevronRight, Crosshair, Folder, FolderOpen, FolderTree, ImagePlus, Loader2, Minus, Pencil, Play, Plus, RefreshCw, Search, Tags, Trash2, X } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { GlassCard } from '../components/GlassCard';
+import { ConfirmModal } from '../components/ConfirmModal';
 import { FocusedPracticeImage } from '../components/FocusedPracticeImage';
 import { useAppContext } from '../context/AppContext';
 import { POSE_MODEL_VERSION } from '../services/poseFocus';
-import { CONTENT_ROUTER_VERSION, VISUAL_ANALYSIS_VERSION } from '../services/contentAnalysis';
+import { CONTENT_ROUTER_VERSION, isAnalysisComplete } from '../services/contentAnalysis';
 import { requestThumbnail } from '../services/thumbnailScheduler';
 import { FocusRegion, ImageRecord, CustomTagGroup } from '../types';
 import { getVirtualFocusTags } from '../utils/focusRegion';
+import { buildLibraryFolders, folderContains, type LibraryFolder } from '../utils/libraryFolders';
 import {
   ASPECT_RATIO_TAGS,
   BODY_PART_TAGS as BODY_PART_TAG_VALUES,
@@ -55,13 +58,6 @@ type LayoutBox = {
   top: number;
   width: number;
   height: number;
-};
-
-type LibraryFolder = {
-  path: string;
-  name: string;
-  depth: number;
-  count: number;
 };
 
 type SelectionBox = {
@@ -281,6 +277,7 @@ const PRACTICE_FILTER_TAGS = ['从未画', '久未画', '画过'];
 const GENERAL_REFERENCE_CATEGORY_NAMES = new Set(['主色调', '对比度', '方向', '画幅']);
 const MULTI_SELECT_EDITOR_CATEGORIES = new Set(['姿势', '机位', '视角']);
 const EDITABLE_TAG_CATEGORIES = TAG_CATEGORIES.filter(category => category.name !== '练习');
+const FILTER_CATEGORIZED_TAGS = new Set(EDITABLE_TAG_CATEGORIES.flatMap(category => category.tags));
 const normalizeEditorTags = (tags: string[]) => {
   const editableTags = new Set(EDITABLE_TAG_CATEGORIES.flatMap(category => category.tags));
   const normalized = tags.filter(tag => !editableTags.has(tag) && !PRACTICE_FILTER_TAGS.includes(tag));
@@ -327,12 +324,10 @@ const thumbnailTagSummary = (
 };
 
 const matchesSelectedTags = (image: ImageRecord, imageTags: string[], selectedTags: string[]): boolean => {
-  const tagCategories = TAG_CATEGORIES.filter(category => category.name !== '练习');
-  const categorizedTags = new Set(tagCategories.flatMap(category => category.tags));
-  const activeGroups = tagCategories
+  const activeGroups = EDITABLE_TAG_CATEGORIES
     .map(category => category.tags.filter(tag => selectedTags.includes(tag)))
     .filter(group => group.length > 0);
-  const uncategorizedTags = selectedTags.filter(tag => !categorizedTags.has(tag) && !PRACTICE_FILTER_TAGS.includes(tag));
+  const uncategorizedTags = selectedTags.filter(tag => !FILTER_CATEGORIZED_TAGS.has(tag) && !PRACTICE_FILTER_TAGS.includes(tag));
   const activePracticeFilters = PRACTICE_FILTER_TAGS.filter(tag => selectedTags.includes(tag));
   const now = Date.now();
   const matchesPractice = activePracticeFilters.length === 0 || activePracticeFilters.some(filter => {
@@ -371,62 +366,28 @@ const getRegionAspectRatio = (image: ImageRecord, region?: FocusRegion): number 
   return 1;
 };
 
-const EXAMPLE_FOLDER = '__examples__';
-const LOOSE_FOLDER = '__loose__';
-
-const imageFolder = (image: ImageRecord) => {
-  if (!image.sourcePath) return EXAMPLE_FOLDER;
-  const relativePath = image.libraryRelativePath?.replace(/\\/g, '/');
-  if (!relativePath?.includes('/')) return LOOSE_FOLDER;
-  return relativePath.slice(0, relativePath.lastIndexOf('/'));
-};
-
-const folderContains = (folder: string, image: ImageRecord) => {
-  const current = imageFolder(image);
-  return current === folder || (!folder.startsWith('__') && current.startsWith(`${folder}/`));
-};
-
-const buildLibraryFolders = (images: ImageRecord[]): LibraryFolder[] => {
-  const counts = new Map<string, number>();
-  images.forEach(image => {
-    const folder = imageFolder(image);
-    if (folder.startsWith('__')) {
-      counts.set(folder, (counts.get(folder) || 0) + 1);
-      return;
-    }
-    const segments = folder.split('/');
-    segments.forEach((_, index) => {
-      const path = segments.slice(0, index + 1).join('/');
-      counts.set(path, (counts.get(path) || 0) + 1);
-    });
-  });
-  return Array.from(counts)
-    .map(([path, count]) => ({
-      path,
-      name: path === EXAMPLE_FOLDER ? '示例素材' : path === LOOSE_FOLDER ? '未分组图片' : path.split('/').at(-1) || path,
-      depth: path.startsWith('__') ? 0 : path.split('/').length - 1,
-      count,
-    }))
-    .sort((left, right) => {
-      if (left.path.startsWith('__') !== right.path.startsWith('__')) return left.path.startsWith('__') ? 1 : -1;
-      return left.path.localeCompare(right.path, 'zh-CN');
-    });
-};
-
-export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onStart }) => {
+export const LibraryView: React.FC<{
+  onStart: (config: any) => void;
+  locateTarget?: { imageId: string; nonce: number } | null;
+  onLocateHandled?: () => void;
+}> = ({ onStart, locateTarget, onLocateHandled }) => {
   const {
-    images, upsertImages, syncLibraryImages, updateImageTags, updateImageThumbnail, removeImage, settings, updateSettings,
-    taggingTask, localizationTask, startImageTagging, startImageLocalization,
+    images, upsertImages, syncLibraryImages, updateImageTags, updateImageThumbnail, removeImage, removeImages, settings, updateSettings,
+    taggingTask, localizationTask, startImageTagging, startImageLocalization, stopImageTagging, stopImageLocalization,
   } = useAppContext();
   const imagesRef = useRef(images);
   const scanPromiseRef = useRef<Promise<void> | null>(null);
   const galleryViewportRef = useRef<HTMLDivElement>(null);
   const galleryGridRef = useRef<HTMLElement | null>(null);
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
   const [galleryScroller, setGalleryScroller] = useState<HTMLElement | null>(null);
   const selectionStartRef = useRef<{
-    x: number;
-    y: number;
+    startClientX: number;
+    startClientY: number;
+    startScrollTop: number;
+    startScrollLeft: number;
     initialIds: string[];
+    sessionHits: Set<string>;
     active: boolean;
     startedOnCard: boolean;
     startedItemId: string | null;
@@ -435,8 +396,11 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
   } | null>(null);
   const suppressCardClickRef = useRef(false);
   const marqueeScrollFrameRef = useRef<number | null>(null);
+  const handledLocateNonceRef = useRef<number | null>(null);
   imagesRef.current = images;
   const [activeTags, setActiveTags] = useState<string[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [internalLocate, setInternalLocate] = useState<{ imageId: string; nonce: number } | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [showFilters, setShowFilters] = useState(false);
   const [showFolders, setShowFolders] = useState(false);
@@ -449,6 +413,24 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
   const [isImporting, setIsImporting] = useState(false);
   const [isScanning, setIsScanning] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
+  const [dismissedMessages, setDismissedMessages] = useState<Set<string>>(() => new Set());
+  const [confirmConfig, setConfirmConfig] = useState<{
+    isOpen: boolean;
+    title: string;
+    description: React.ReactNode;
+    confirmText?: string;
+    cancelText?: string;
+    type?: 'danger' | 'warning';
+    onConfirm: () => void;
+  }>({
+    isOpen: false,
+    title: '',
+    description: '',
+    confirmText: '确认',
+    cancelText: '取消',
+    type: 'danger',
+    onConfirm: () => undefined,
+  });
   const [practiceMinutes, setPracticeMinutes] = useState<number | string>(1);
   const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null);
   const [galleryViewportWidth, setGalleryViewportWidth] = useState(0);
@@ -567,16 +549,28 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
   );
 
   const pendingPoseImages = useMemo(() => folderImages.filter(image => (
-    image.sourcePath && (
-      image.poseAnalysis?.modelVersion !== POSE_MODEL_VERSION
-      || image.contentRouting?.modelVersion !== CONTENT_ROUTER_VERSION
-      || image.visualAnalysis?.modelVersion !== VISUAL_ANALYSIS_VERSION
-    )
+    image.sourcePath && !isAnalysisComplete(image)
   )), [folderImages]);
+
+  const removeFilterTag = (tag: string) => {
+    setActiveTags(current => {
+      let next = current.filter(item => item !== tag);
+      if (tag === '人体局部') {
+        next = next.filter(item => !(BODY_PART_TAGS as readonly string[]).includes(item));
+      }
+      return next;
+    });
+  };
 
   const toggleFilterTag = (tag: string) => {
     setActiveTags(current => {
-      if (current.includes(tag)) return current.filter(item => item !== tag);
+      if (current.includes(tag)) {
+        let next = current.filter(item => item !== tag);
+        if (tag === '人体局部') {
+          next = next.filter(item => !(BODY_PART_TAGS as readonly string[]).includes(item));
+        }
+        return next;
+      }
       if ((BODY_PART_TAGS as readonly string[]).includes(tag)) {
         return Array.from(new Set([...current, '人体局部', tag]));
       }
@@ -587,42 +581,113 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
     });
   };
 
+  const normalizedSearchQuery = searchQuery.trim().toLowerCase();
+
   const displayItems = useMemo<LibraryDisplayItem[]>(() => {
+    let items: LibraryDisplayItem[];
     if (!activeTags.includes('人体局部')) {
-      return folderImages
+      items = folderImages
         .filter(image => !image.hidden && matchesSelectedTags(image, image.tags, activeTags))
         .map(image => ({ id: image.id, image, tags: image.tags }));
+    } else {
+      items = folderImages.flatMap(image => {
+        if (image.hidden) return [];
+        const result: LibraryDisplayItem[] = [];
+        if (matchesSelectedTags(image, image.tags, activeTags)) {
+          result.push({ id: image.id, image, tags: image.tags });
+        }
+        if (
+          image.poseAnalysis?.status === 'detected'
+          && image.poseAnalysis.modelVersion === POSE_MODEL_VERSION
+        ) {
+          image.poseAnalysis.regions.forEach(region => {
+            const virtualTags = getVirtualFocusTags(image.tags, region);
+            if (matchesSelectedTags(image, virtualTags, activeTags)) {
+              result.push({
+                id: `${image.id}${FOCUS_ID_SEPARATOR}${region.id}`,
+                image,
+                tags: virtualTags,
+                focusRegion: region,
+              });
+            }
+          });
+        }
+        return result;
+      });
     }
 
-    return folderImages.flatMap(image => {
-      if (image.hidden) return [];
-      const items: LibraryDisplayItem[] = [];
-      if (matchesSelectedTags(image, image.tags, activeTags)) {
-        items.push({ id: image.id, image, tags: image.tags });
-      }
-      if (
-        image.poseAnalysis?.status === 'detected'
-        && image.poseAnalysis.modelVersion === POSE_MODEL_VERSION
-      ) {
-        image.poseAnalysis.regions.forEach(region => {
-          const virtualTags = getVirtualFocusTags(image.tags, region);
-          if (matchesSelectedTags(image, virtualTags, activeTags)) {
-            items.push({
-              id: `${image.id}${FOCUS_ID_SEPARATOR}${region.id}`,
-              image,
-              tags: virtualTags,
-              focusRegion: region,
-            });
-          }
-        });
-      }
-      return items;
-    });
-  }, [folderImages, activeTags]);
+    if (normalizedSearchQuery) {
+      items = items.filter(item => {
+        const fileName = (item.image.fileName || '').toLowerCase();
+        if (fileName.includes(normalizedSearchQuery)) return true;
+        return item.tags.some(tag => tag.toLowerCase().includes(normalizedSearchQuery));
+      });
+    }
+    return items;
+  }, [folderImages, activeTags, normalizedSearchQuery]);
   const justifiedLayout = useMemo(
     () => buildJustifiedLayout(displayItems, galleryViewportWidth, thumbnailWidth),
     [displayItems, galleryViewportWidth, thumbnailWidth],
   );
+
+  useEffect(() => {
+    const target = internalLocate || locateTarget;
+    if (!target || handledLocateNonceRef.current === target.nonce) return;
+
+    const hasActiveFilters = activeFolder !== null || activeTags.length > 0 || searchQuery !== '';
+    if (hasActiveFilters) {
+      setActiveFolder(null);
+      setActiveTags([]);
+      setSearchQuery('');
+      // Wait for layout to recompute on next render cycle with cleared filters
+      return;
+    }
+
+    if (justifiedLayout.rows.length === 0) {
+      // Gallery layout not computed yet (e.g. initial mount or viewport width measurement pending)
+      return;
+    }
+
+    const rowIndex = justifiedLayout.rows.findIndex(row => row.items.some(item => item.image.id === target.imageId));
+    if (rowIndex >= 0) {
+      const row = justifiedLayout.rows[rowIndex];
+      const performScroll = () => {
+        virtuosoRef.current?.scrollToIndex({ index: rowIndex, align: 'center' });
+        const scroller = galleryGridRef.current;
+        if (scroller && row) {
+          const viewportHeight = scroller.clientHeight || 600;
+          const targetTop = Math.max(0, row.top - Math.max(0, (viewportHeight - row.height) / 2));
+          scroller.scrollTop = targetTop;
+        }
+      };
+
+      // 立即触发
+      performScroll();
+      // 下一帧触发（确保 DOM 渲染完成）
+      const rafId = requestAnimationFrame(performScroll);
+      // 100ms 与 250ms 再次触发（确保视图切换动画完成时对齐）
+      const timer1 = window.setTimeout(performScroll, 100);
+      const timer2 = window.setTimeout(performScroll, 250);
+
+      setSelectedIds([target.imageId]);
+      handledLocateNonceRef.current = target.nonce;
+      if (internalLocate) setInternalLocate(null);
+      onLocateHandled?.();
+      return () => {
+        cancelAnimationFrame(rafId);
+        window.clearTimeout(timer1);
+        window.clearTimeout(timer2);
+      };
+    } else {
+      const existsInImages = images.some(img => img.id === target.imageId);
+      if (!existsInImages && !isScanning) {
+        // Image definitely does not exist in library, dismiss target
+        handledLocateNonceRef.current = target.nonce;
+        if (internalLocate) setInternalLocate(null);
+        onLocateHandled?.();
+      }
+    }
+  }, [internalLocate, locateTarget, justifiedLayout, activeFolder, activeTags, searchQuery, images, isScanning, onLocateHandled]);
   const syncVisibleRows = useCallback(() => {
     const scroller = galleryGridRef.current;
     const rows = justifiedLayout.rows;
@@ -669,7 +734,10 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
     syncVisibleRows();
   }, [galleryScroller, syncVisibleRows]);
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
-  const selectedImages = useMemo(() => images.filter(img => selectedIdSet.has(img.id)), [images, selectedIdSet]);
+  const selectedImages = useMemo(() => {
+    const targetImageIds = new Set(selectedIds.map(id => id.split(FOCUS_ID_SEPARATOR)[0]));
+    return images.filter(img => targetImageIds.has(img.id));
+  }, [images, selectedIds]);
 
   const importPaths = async (directory: boolean) => {
     setShowImportMenu(false);
@@ -779,30 +847,84 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
     if (!start || !grid) return;
     start.lastClientX = clientX;
     start.lastClientY = clientY;
-    const bounds = grid.getBoundingClientRect();
-    const x = Math.min(grid.scrollWidth, Math.max(0, clientX - bounds.left + grid.scrollLeft));
-    const y = Math.min(grid.scrollHeight, Math.max(0, clientY - bounds.top + grid.scrollTop));
-    if (!start.active && Math.hypot(x - start.x, y - start.y) < 5) return;
+    if (!start.active && Math.hypot(clientX - start.startClientX, clientY - start.startClientY) < 5) return;
     if (!start.active) {
       start.active = true;
       suppressCardClickRef.current = start.startedOnCard;
       if (start.initialIds.length === 0) setSelectedIds([]);
     }
-    const nextBox = {
-      left: Math.min(start.x, x),
-      top: Math.min(start.y, y),
-      width: Math.abs(x - start.x),
-      height: Math.abs(y - start.y),
-    };
-    setSelectionBox(nextBox);
+    const bounds = grid.getBoundingClientRect();
 
-    const hits = justifiedLayout.boxes.filter(box => (
-      box.left < nextBox.left + nextBox.width
-      && box.left + box.width > nextBox.left
-      && box.top < nextBox.top + nextBox.height
-      && box.top + box.height > nextBox.top
-    )).map(box => box.id);
-    setSelectedIds(Array.from(new Set([...start.initialIds, ...hits])));
+    // 1. 计算选框在内容画卷（Content Canvas）中的绝对坐标
+    const startContentX = start.startClientX - bounds.left + start.startScrollLeft;
+    const startContentY = start.startClientY - bounds.top + start.startScrollTop;
+    const currentContentX = clientX - bounds.left + grid.scrollLeft;
+    const currentContentY = clientY - bounds.top + grid.scrollTop;
+
+    const contentMinX = Math.min(startContentX, currentContentX);
+    const contentMaxX = Math.max(startContentX, currentContentX);
+    const contentMinY = Math.min(startContentY, currentContentY);
+    const contentMaxY = Math.max(startContentY, currentContentY);
+
+    // 2. 映射回当前可视容器（galleryViewportRef）的视觉渲染矩形
+    // 随滚动移出视口时，visualTop 为负数，顶边自然滑出屏幕顶部（牢牢钉在原位）！
+    const visualLeft = contentMinX - grid.scrollLeft;
+    const visualTop = contentMinY - grid.scrollTop;
+    const visualWidth = contentMaxX - contentMinX;
+    const visualHeight = contentMaxY - contentMinY;
+
+    const nextBox = {
+      left: visualLeft,
+      top: visualTop,
+      width: visualWidth,
+      height: visualHeight,
+    };
+
+    setSelectionBox(prev => (
+      prev && prev.left === nextBox.left && prev.top === nextBox.top && prev.width === nextBox.width && prev.height === nextBox.height
+        ? prev
+        : nextBox
+    ));
+
+    // 3. 计算选框在当前屏幕可视区域内的有效相交物理矩形（Client 坐标）
+    // 既实现选框顶边钉在内容上，又保证视口内的 DOM 碰撞判定 100% 绝对精准！
+    const visibleClientLeft = bounds.left + Math.max(0, visualLeft);
+    const visibleClientTop = bounds.top + Math.max(0, visualTop);
+    const visibleClientRight = bounds.left + Math.min(bounds.width, visualLeft + visualWidth);
+    const visibleClientBottom = bounds.top + Math.min(bounds.height, visualTop + visualHeight);
+
+    const visibleHits: string[] = [];
+    if (visibleClientRight > visibleClientLeft && visibleClientBottom > visibleClientTop) {
+      grid.querySelectorAll<HTMLElement>('[data-library-card]').forEach(card => {
+        const r = card.getBoundingClientRect();
+        if (r.left < visibleClientRight && r.right > visibleClientLeft && r.top < visibleClientBottom && r.bottom > visibleClientTop) {
+          const id = card.dataset.libraryItemId;
+          if (id) visibleHits.push(id);
+        }
+      });
+    }
+
+    const hasScrolled = Math.abs(grid.scrollTop - start.startScrollTop) > 3;
+    if (hasScrolled) {
+      // 跨屏滚动时：持续累加所有曾被选框扫过的图片，避免 DOM 卸载导致选区丢失
+      visibleHits.forEach(id => start.sessionHits.add(id));
+      const nextSelected = Array.from(new Set([...start.initialIds, ...start.sessionHits, ...visibleHits]));
+      setSelectedIds(prev => (
+        prev.length === nextSelected.length && prev.every((id, index) => id === nextSelected[index])
+          ? prev
+          : nextSelected
+      ));
+    } else {
+      // 单屏内未滚动时：支持自由拉大/缩小选框
+      start.sessionHits.clear();
+      visibleHits.forEach(id => start.sessionHits.add(id));
+      const nextSelected = Array.from(new Set([...start.initialIds, ...visibleHits]));
+      setSelectedIds(prev => (
+        prev.length === nextSelected.length && prev.every((id, index) => id === nextSelected[index])
+          ? prev
+          : nextSelected
+      ));
+    }
   };
 
   const startMarqueeAutoScroll = () => {
@@ -839,15 +961,15 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
     if (!event.isPrimary || event.button !== 0 || (event.target as HTMLElement).closest('[data-library-action]')) return;
     const grid = galleryGridRef.current;
     if (!grid) return;
-    const bounds = grid.getBoundingClientRect();
-    const x = Math.min(grid.scrollWidth, Math.max(0, event.clientX - bounds.left + grid.scrollLeft));
-    const y = Math.min(grid.scrollHeight, Math.max(0, event.clientY - bounds.top + grid.scrollTop));
     const preserveSelection = event.ctrlKey || event.metaKey || event.shiftKey;
     const startedCard = (event.target as HTMLElement).closest<HTMLElement>('[data-library-card]');
     selectionStartRef.current = {
-      x,
-      y,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startScrollTop: grid.scrollTop,
+      startScrollLeft: grid.scrollLeft,
       initialIds: preserveSelection ? selectedIds : [],
+      sessionHits: new Set<string>(),
       active: false,
       startedOnCard: Boolean(startedCard),
       startedItemId: startedCard?.dataset.libraryItemId || null,
@@ -870,10 +992,7 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
       return;
     }
     if (!start.active) {
-      const bounds = grid.getBoundingClientRect();
-      const x = Math.min(grid.scrollWidth, Math.max(0, event.clientX - bounds.left + grid.scrollLeft));
-      const y = Math.min(grid.scrollHeight, Math.max(0, event.clientY - bounds.top + grid.scrollTop));
-      if (Math.hypot(x - start.x, y - start.y) >= 5) {
+      if (Math.hypot(event.clientX - start.startClientX, event.clientY - start.startClientY) >= 5) {
         event.currentTarget.setPointerCapture(event.pointerId);
       }
     }
@@ -901,7 +1020,8 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
   };
 
   const startSelectedPractice = () => {
-    const minutes = Math.max(0, Number(practiceMinutes) || 0);
+    const parsedMinutes = Number(practiceMinutes);
+    const minutes = (!isNaN(parsedMinutes) && parsedMinutes > 0) ? parsedMinutes : 1;
     const practiceItems = selectedIds.map(id => {
       const [imageId, focusRegionId] = id.split(FOCUS_ID_SEPARATOR);
       return { imageId, focusRegionId };
@@ -919,37 +1039,168 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
     });
   };
 
-  const clearImageMetadata = (image: ImageRecord) => {
-    upsertImages([{
-      ...image,
-      tags: [],
-      tagStatus: 'pending',
-      tagError: undefined,
-      poseAnalysis: undefined,
-      contentRouting: undefined,
-      visualAnalysis: undefined,
-    }]);
-    setSelectedIds(current => current.filter(id => !id.startsWith(`${image.id}${FOCUS_ID_SEPARATOR}`)));
-    setEditingImage(null);
-    setEditingFocusRegion(undefined);
-    setNotice(`已清除 ${image.fileName || '图片'} 的标签和定位数据`);
+  const clearImageTags = (image: ImageRecord) => {
+    setConfirmConfig({
+      isOpen: true,
+      title: '清除图片标签',
+      description: `确定清空“${image.fileName || '这张图片'}”的标签吗？姿势与切片定位将被保留。`,
+      confirmText: '清除标签',
+      cancelText: '取消',
+      type: 'warning',
+      onConfirm: () => {
+        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        upsertImages([{
+          ...image,
+          tags: [],
+          tagStatus: 'pending',
+          tagError: undefined,
+        }]);
+        setEditingImage(null);
+        setEditingFocusRegion(undefined);
+        setNotice(`已清除 ${image.fileName || '图片'} 的标签数据`);
+      },
+    });
   };
 
-  const removeLibraryImage = async (image: ImageRecord) => {
-    const confirmed = window.confirm(`确定移除“${image.fileName || '这张图片'}”吗？\n\n图库目录中的文件会被删除，此操作无法撤销。`);
-    if (!confirmed) return;
-    try {
-      if (image.sourcePath) {
-        await invoke('remove_library_image', { imagePath: image.sourcePath });
-      }
-      removeImage(image.id);
-      setSelectedIds(current => current.filter(id => !id.startsWith(image.id)));
-      setEditingImage(null);
-      setEditingFocusRegion(undefined);
-      setNotice(`已移除 ${image.fileName || '图片'}`);
-    } catch (error) {
-      setNotice(String(error));
-    }
+  const clearImageLocalization = (image: ImageRecord) => {
+    setConfirmConfig({
+      isOpen: true,
+      title: '清除图片定位',
+      description: `确定清空“${image.fileName || '这张图片'}”的姿势与局部切片吗？分类标签将被保留。`,
+      confirmText: '清除定位',
+      cancelText: '取消',
+      type: 'warning',
+      onConfirm: () => {
+        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        upsertImages([{
+          ...image,
+          poseAnalysis: undefined,
+          contentRouting: undefined,
+          visualAnalysis: undefined,
+        }]);
+        setSelectedIds(current => current.filter(id => !id.startsWith(`${image.id}${FOCUS_ID_SEPARATOR}`)));
+        setEditingImage(null);
+        setEditingFocusRegion(undefined);
+        setNotice(`已清除 ${image.fileName || '图片'} 的定位数据`);
+      },
+    });
+  };
+
+  const clearBatchTags = (imagesToClear: ImageRecord[]) => {
+    if (imagesToClear.length === 0) return;
+    setConfirmConfig({
+      isOpen: true,
+      title: `批量清除 ${imagesToClear.length} 张图片的标签`,
+      description: `确定清除已选 ${imagesToClear.length} 张图片的标签吗？姿势与切片定位将被保留。`,
+      confirmText: `清除标签 (${imagesToClear.length} 张)`,
+      cancelText: '取消',
+      type: 'warning',
+      onConfirm: () => {
+        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        const updated = imagesToClear.map(image => ({
+          ...image,
+          tags: [],
+          tagStatus: 'pending' as const,
+          tagError: undefined,
+        }));
+        upsertImages(updated);
+        setIsBatchEditing(false);
+        setNotice(`已清除 ${imagesToClear.length} 张图片的标签`);
+      },
+    });
+  };
+
+  const clearBatchLocalization = (imagesToClear: ImageRecord[]) => {
+    if (imagesToClear.length === 0) return;
+    setConfirmConfig({
+      isOpen: true,
+      title: `批量清除 ${imagesToClear.length} 张图片的定位`,
+      description: `确定清除已选 ${imagesToClear.length} 张图片的姿势与局部切片吗？分类标签将被保留。`,
+      confirmText: `清除定位 (${imagesToClear.length} 张)`,
+      cancelText: '取消',
+      type: 'warning',
+      onConfirm: () => {
+        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        const updated = imagesToClear.map(image => ({
+          ...image,
+          poseAnalysis: undefined,
+          contentRouting: undefined,
+          visualAnalysis: undefined,
+        }));
+        upsertImages(updated);
+        setIsBatchEditing(false);
+        setNotice(`已清除 ${imagesToClear.length} 张图片的定位数据`);
+      },
+    });
+  };
+
+  const removeLibraryImage = (image: ImageRecord) => {
+    setConfirmConfig({
+      isOpen: true,
+      title: '移除照片',
+      description: `确定从图库中移除“${image.fileName || '这张图片'}”吗？本地文件将被永久删除。`,
+      confirmText: '确认移除',
+      cancelText: '取消',
+      type: 'danger',
+      onConfirm: async () => {
+        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        try {
+          if (image.sourcePath) {
+            await invoke('remove_library_image', { imagePath: image.sourcePath });
+          }
+          removeImage(image.id);
+          setSelectedIds(current => current.filter(id => !id.startsWith(image.id)));
+          setEditingImage(null);
+          setEditingFocusRegion(undefined);
+          setNotice(`已移除 ${image.fileName || '图片'}`);
+        } catch (error) {
+          setNotice(String(error));
+        }
+      },
+    });
+  };
+
+  const removeBatchImages = (imagesToRemove: ImageRecord[]) => {
+    if (imagesToRemove.length === 0) return;
+    setConfirmConfig({
+      isOpen: true,
+      title: `批量移除 ${imagesToRemove.length} 张照片`,
+      description: `确定从图库中移除已选 ${imagesToRemove.length} 张图片吗？本地文件将被永久删除。`,
+      confirmText: `永久移除 (${imagesToRemove.length} 张)`,
+      cancelText: '取消',
+      type: 'danger',
+      onConfirm: async () => {
+        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        try {
+          const validPaths = imagesToRemove.map(img => img.sourcePath).filter(Boolean) as string[];
+          if (validPaths.length > 0) {
+            await invoke('remove_library_images', { imagePaths: validPaths });
+          }
+          const idsToRemove = imagesToRemove.map(img => img.id);
+          removeImages(idsToRemove);
+          setSelectedIds([]);
+          setIsBatchEditing(false);
+          setNotice(`已移除 ${imagesToRemove.length} 张图片`);
+        } catch (error) {
+          setNotice(`移除失败：${String(error)}`);
+        }
+      },
+    });
+  };
+
+  const viewOriginalImage = (image: ImageRecord) => {
+    setEditingImage(null);
+    setEditingFocusRegion(undefined);
+    setPreviewZoomItem({ image, focusRegion: undefined });
+  };
+
+  const locateOriginalImage = (image: ImageRecord) => {
+    setEditingImage(null);
+    setEditingFocusRegion(undefined);
+    setActiveFolder(null);
+    setActiveTags([]);
+    setSearchQuery('');
+    setInternalLocate({ imageId: image.id, nonce: Date.now() });
   };
 
   useEffect(() => {
@@ -985,27 +1236,27 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
               <RefreshCw size={12} className={isScanning ? 'animate-spin' : ''} />
             </button>
             <button
-              onClick={tagPendingImages}
-              disabled={taggingTask.running || pendingImages.length === 0}
-              title={pendingImages.length > 0 ? `当前图包有 ${pendingImages.length} 张图片等待自动打标` : '当前图包没有待打标图片'}
-              aria-label="自动打标签"
-              className={`flex h-8 min-w-8 shrink items-center justify-center gap-1 rounded-lg border border-amber-300/60 bg-amber-50/80 text-[9px] font-bold text-amber-900 transition-all disabled:opacity-40 dark:border-amber-700/40 dark:bg-amber-950/20 dark:text-amber-200 ${pendingImages.length > 0 ? 'px-2 max-[520px]:px-0' : 'w-8'}`}
+              onClick={taggingTask.running ? stopImageTagging : tagPendingImages}
+              disabled={!taggingTask.running && pendingImages.length === 0}
+              title={taggingTask.running ? '停止本次自动打标' : pendingImages.length > 0 ? `当前图包有 ${pendingImages.length} 张图片等待自动打标` : '当前图包没有待打标图片'}
+              aria-label={taggingTask.running ? '停止自动打标签' : '自动打标签'}
+              className={`flex h-8 min-w-8 shrink items-center justify-center gap-1 rounded-lg border border-amber-300/60 bg-amber-50/80 text-[9px] font-bold text-amber-900 transition-all disabled:opacity-40 dark:border-amber-700/40 dark:bg-amber-950/20 dark:text-amber-200 ${taggingTask.running || pendingImages.length > 0 ? 'px-2 max-[520px]:px-0' : 'w-8'}`}
             >
-              {taggingTask.running ? <Loader2 size={12} className="animate-spin" /> : <Tags size={12} />}
+              {taggingTask.running ? <X size={12} /> : <Tags size={12} />}
               {taggingTask.running
-                ? <span className="max-[520px]:hidden">{taggingTask.current}/{taggingTask.total}</span>
+                ? <span className="whitespace-nowrap max-[520px]:hidden">{taggingTask.current}/{taggingTask.total} · 停止</span>
                 : pendingImages.length > 0 && <span className="whitespace-nowrap max-[520px]:hidden">{pendingImages.length} 未打标</span>}
             </button>
             <button
-              onClick={locatePendingImages}
-              disabled={localizationTask.running || pendingPoseImages.length === 0}
-              title={pendingPoseImages.length > 0 ? `当前图包有 ${pendingPoseImages.length} 张图片等待素材分析` : '当前图包没有待分析图片'}
-              aria-label="分析素材内容"
-              className={`flex h-8 min-w-8 shrink items-center justify-center gap-1 rounded-lg border border-sky-300/60 bg-sky-50/80 text-[9px] font-bold text-sky-900 transition-all disabled:opacity-40 dark:border-sky-700/40 dark:bg-sky-950/20 dark:text-sky-200 ${pendingPoseImages.length > 0 ? 'px-2 max-[520px]:px-0' : 'w-8'}`}
+              onClick={localizationTask.running ? stopImageLocalization : locatePendingImages}
+              disabled={!localizationTask.running && pendingPoseImages.length === 0}
+              title={localizationTask.running ? '停止本次素材分析' : pendingPoseImages.length > 0 ? `当前图包有 ${pendingPoseImages.length} 张图片等待素材分析` : '当前图包没有待分析图片'}
+              aria-label={localizationTask.running ? '停止素材分析' : '分析素材内容'}
+              className={`flex h-8 min-w-8 shrink items-center justify-center gap-1 rounded-lg border border-sky-300/60 bg-sky-50/80 text-[9px] font-bold text-sky-900 transition-all disabled:opacity-40 dark:border-sky-700/40 dark:bg-sky-950/20 dark:text-sky-200 ${localizationTask.running || pendingPoseImages.length > 0 ? 'px-2 max-[520px]:px-0' : 'w-8'}`}
             >
-              {localizationTask.running ? <Loader2 size={12} className="animate-spin" /> : <Crosshair size={12} />}
+              {localizationTask.running ? <X size={12} /> : <Crosshair size={12} />}
               {localizationTask.running
-                ? <span className="max-[520px]:hidden">{localizationTask.current}/{localizationTask.total}</span>
+                ? <span className="whitespace-nowrap max-[520px]:hidden">{localizationTask.current}/{localizationTask.total} · 停止</span>
                 : pendingPoseImages.length > 0 && <span className="whitespace-nowrap max-[520px]:hidden">{pendingPoseImages.length} 未分析</span>}
             </button>
             <div className="relative shrink-0">
@@ -1038,12 +1289,30 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
           </div>
         </div>
 
-        {(notice || taggingTask.error || localizationTask.error || taggingTask.message || localizationTask.message) && (
-          <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-black/5 dark:bg-white/5 text-[10px] text-stone-600 dark:text-zinc-300">
-            <span className="flex-1 leading-relaxed">{notice || taggingTask.error || localizationTask.error || taggingTask.message || localizationTask.message}</span>
-            {notice && <button onClick={() => setNotice(null)}><X size={12} /></button>}
-          </div>
-        )}
+        {(() => {
+          const currentTaskError = taggingTask.error || localizationTask.error;
+          const currentTaskMsg = taggingTask.message || localizationTask.message;
+          const activeNotice = notice
+            || (currentTaskError && !dismissedMessages.has(currentTaskError) ? currentTaskError : null)
+            || (currentTaskMsg && !dismissedMessages.has(currentTaskMsg) ? currentTaskMsg : null);
+          if (!activeNotice) return null;
+          return (
+            <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-black/5 dark:bg-white/5 text-[10px] text-stone-600 dark:text-zinc-300">
+              <span className="flex-1 leading-relaxed">{activeNotice}</span>
+              <button
+                onClick={() => {
+                  setNotice(null);
+                  if (currentTaskError) setDismissedMessages(prev => new Set(prev).add(currentTaskError));
+                  if (currentTaskMsg) setDismissedMessages(prev => new Set(prev).add(currentTaskMsg));
+                }}
+                className="shrink-0 p-0.5 hover:opacity-70 cursor-pointer"
+                aria-label="关闭提示"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          );
+        })()}
 
         <div className="min-w-0">
           <div className="flex w-full min-w-0 items-center gap-1">
@@ -1061,7 +1330,20 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
             >
               <Tags size={12} /> 筛选{activeTags.length > 0 ? ` · ${activeTags.length}` : ''}
             </button>
-            <div className="min-w-0 flex-1" />
+            <div className="flex h-7 min-w-0 flex-1 items-center gap-1 rounded-lg border border-black/5 bg-black/[0.03] px-2 dark:border-white/5 dark:bg-white/[0.05]">
+              <Search size={12} className="shrink-0 text-stone-400" />
+              <input
+                value={searchQuery}
+                onChange={event => setSearchQuery(event.target.value)}
+                placeholder="搜索文件名 / 标签"
+                className="min-w-0 flex-1 bg-transparent text-[10px] font-medium text-stone-700 placeholder:text-stone-400 focus:outline-none dark:text-zinc-200 dark:placeholder:text-zinc-500"
+              />
+              {searchQuery && (
+                <button onClick={() => setSearchQuery('')} className="shrink-0 text-stone-400 hover:text-stone-700 dark:hover:text-zinc-200" aria-label="清除搜索">
+                  <X size={11} />
+                </button>
+              )}
+            </div>
             <ThumbnailSizeControl
               value={thumbnailWidth}
               onChange={value => updateSettings({ libraryThumbnailWidth: value })}
@@ -1070,7 +1352,7 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
           {activeTags.length > 0 && (
             <div className="mt-1.5 flex min-w-0 flex-wrap gap-1 overflow-hidden">
               {activeTags.map(tag => (
-                <button key={tag} onClick={() => setActiveTags(tags => tags.filter(item => item !== tag))} className="flex h-6 items-center gap-1 rounded-md border border-white/80 bg-white px-2 text-[9px] font-medium text-stone-900 shadow-[0_0_12px_rgba(255,255,255,0.9),0_2px_6px_rgba(0,0,0,0.08)] dark:border-white/10 dark:bg-zinc-700 dark:text-zinc-100 dark:shadow-[0_0_12px_rgba(255,255,255,0.15)]">
+                <button key={tag} onClick={() => removeFilterTag(tag)} className="flex h-6 items-center gap-1 rounded-md border border-white/80 bg-white px-2 text-[9px] font-medium text-stone-900 shadow-[0_0_12px_rgba(255,255,255,0.9),0_2px_6px_rgba(0,0,0,0.08)] dark:border-white/10 dark:bg-zinc-700 dark:text-zinc-100 dark:shadow-[0_0_12px_rgba(255,255,255,0.15)]">
                   {tag}<X size={9} />
                 </button>
               ))}
@@ -1100,8 +1382,10 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
           </div>
         )}
         <Virtuoso
+          ref={virtuosoRef}
           data={justifiedLayout.rows}
           computeItemKey={(_, row) => row.items.map(item => item.id).join('|')}
+          defaultItemHeight={thumbnailWidth + GALLERY_GAP}
           increaseViewportBy={{ top: 280, bottom: 480 }}
           overscan={{ main: 240, reverse: 160 }}
           scrollerRef={setGalleryScrollerRef}
@@ -1160,11 +1444,7 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
         {selectionBox && (
           <div
             className="absolute z-30 pointer-events-none rounded-sm border border-stone-700/70 dark:border-white/70 bg-stone-500/10 dark:bg-white/10"
-            style={{
-              ...selectionBox,
-              left: selectionBox.left - (galleryGridRef.current?.scrollLeft || 0),
-              top: selectionBox.top - (galleryGridRef.current?.scrollTop || 0),
-            }}
+            style={selectionBox}
           />
         )}
       </div>
@@ -1209,6 +1489,9 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
             images={selectedImages}
             customTagGroups={settings.customTagGroups || []}
             onClose={() => setIsBatchEditing(false)}
+            onClearTags={() => clearBatchTags(selectedImages)}
+            onClearLocalization={() => clearBatchLocalization(selectedImages)}
+            onRemoveImages={() => removeBatchImages(selectedImages)}
             onApply={(tagsToAdd, tagsToRemove) => {
               if (tagsToAdd.length === 0 && tagsToRemove.length === 0) {
                 setIsBatchEditing(false);
@@ -1280,8 +1563,11 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
               setEditingImage(null);
               setEditingFocusRegion(undefined);
             }}
-            onClearMetadata={() => clearImageMetadata(editingImage)}
+            onClearTags={() => clearImageTags(editingImage)}
+            onClearLocalization={() => clearImageLocalization(editingImage)}
             onRemove={() => removeLibraryImage(editingImage)}
+            onViewOriginal={() => viewOriginalImage(editingImage)}
+            onLocateOriginal={() => locateOriginalImage(editingImage)}
           />
         )}
       </AnimatePresence>
@@ -1292,14 +1578,14 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
+            transition={{ duration: 0.1 }}
             className="fixed inset-0 z-[100] bg-black/90 flex items-center justify-center p-4 sm:p-10 cursor-default select-none"
             onClick={() => setPreviewZoomItem(null)}
           >
             {/* 精简小巧的悬浮关闭按钮 */}
-            <motion.button 
-              initial={{ opacity: 0, scale: 0.9 }}
-              animate={{ opacity: 1, scale: 1 }}
-              className="absolute top-4 right-4 z-20 w-7 h-7 flex items-center justify-center bg-white/10 hover:bg-white/20 text-white/80 hover:text-white rounded-full backdrop-blur-md transition-all hover:scale-105 active:scale-95 cursor-pointer"
+            <button 
+              type="button"
+              className="absolute top-4 right-4 z-20 w-8 h-8 flex items-center justify-center bg-white/10 hover:bg-white/20 text-white/80 hover:text-white rounded-full backdrop-blur-md transition-all hover:scale-105 active:scale-95 cursor-pointer"
               onClick={(e) => {
                 e.stopPropagation();
                 setPreviewZoomItem(null);
@@ -1307,14 +1593,14 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
               aria-label="关闭预览"
               title="关闭 (Esc / 单击任意处)"
             >
-              <X size={14} strokeWidth={2.2} />
-            </motion.button>
+              <X size={16} strokeWidth={2.2} />
+            </button>
 
             <motion.div
-              initial={{ scale: 0.92, opacity: 0 }}
+              initial={{ scale: 0.96, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.92, opacity: 0 }}
-              transition={{ type: 'spring', damping: 25, stiffness: 300 }}
+              exit={{ scale: 0.96, opacity: 0 }}
+              transition={{ duration: 0.1 }}
               style={
                 previewZoomItem.focusRegion
                   ? {
@@ -1329,9 +1615,8 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
                   ? 'w-[85vw] max-w-[700px] bg-zinc-950 shadow-2xl'
                   : 'max-w-[90vw] max-h-[90vh]'
               }`}
-              onClick={() => setPreviewZoomItem(null)}
+              onClick={(e) => e.stopPropagation()}
             >
-
               {previewZoomItem.focusRegion ? (
                 <FocusedPracticeImage
                   image={previewZoomItem.image}
@@ -1350,6 +1635,17 @@ export const LibraryView: React.FC<{ onStart: (config: any) => void }> = ({ onSt
           </motion.div>
         )}
       </AnimatePresence>
+
+      <ConfirmModal
+        isOpen={confirmConfig.isOpen}
+        title={confirmConfig.title}
+        description={confirmConfig.description}
+        confirmText={confirmConfig.confirmText}
+        cancelText={confirmConfig.cancelText}
+        type={confirmConfig.type}
+        onConfirm={confirmConfig.onConfirm}
+        onCancel={() => setConfirmConfig(prev => ({ ...prev, isOpen: false }))}
+      />
     </div>
   );
 };
@@ -1427,7 +1723,10 @@ const FolderList = ({ folders, selected, total, onSelect }: {
       initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }}
       className="overflow-hidden"
     >
-      <div className="mt-2 max-h-56 overflow-y-auto p-1.5 rounded-xl bg-black/[0.03] dark:bg-white/[0.04] border border-black/5 dark:border-white/5 [&::-webkit-scrollbar]:hidden">
+      <div
+        onWheel={e => e.stopPropagation()}
+        className="mt-2 max-h-56 overflow-y-auto p-1.5 rounded-xl bg-black/[0.03] dark:bg-white/[0.04] border border-black/5 dark:border-white/5 overscroll-contain [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-thumb]:bg-black/10 dark:[&::-webkit-scrollbar-thumb]:bg-white/10 [&::-webkit-scrollbar-thumb]:rounded-full"
+      >
         <div className="flex h-8 items-center gap-1">
           <button
             onClick={() => onSelect(null)}
@@ -1701,8 +2000,11 @@ const TagEditor = ({
   onClose,
   onRoute,
   onSave,
-  onClearMetadata,
+  onClearTags,
+  onClearLocalization,
   onRemove,
+  onViewOriginal,
+  onLocateOriginal,
 }: {
   image: ImageRecord;
   focusRegion?: FocusRegion;
@@ -1710,8 +2012,11 @@ const TagEditor = ({
   onClose: () => void;
   onRoute: (scope: ManualContentRoute) => void;
   onSave: (tags: string[]) => void;
-  onClearMetadata: () => void;
+  onClearTags: () => void;
+  onClearLocalization: () => void;
   onRemove: () => void;
+  onViewOriginal?: () => void;
+  onLocateOriginal?: () => void;
 }) => {
   const initialScope: ManualContentRoute = image.contentRouting?.scope === 'general_reference' || image.tags.includes('综合参考')
     ? 'general_reference'
@@ -1811,9 +2116,12 @@ const TagEditor = ({
               <span className="inline-flex rounded-lg bg-stone-800 px-2.5 py-1.5 text-[10px] font-medium text-white dark:bg-zinc-100 dark:text-zinc-900">
                 {focusRegion.tag}
               </span>
+              <p className="mt-2 text-[9px] leading-relaxed text-stone-500 dark:text-zinc-400">
+                这是从原图生成的虚拟局部，标签与定位归属于整张原图。如需修改，请打开原图后编辑。
+              </p>
             </div>
           )}
-          {visibleCategories.map(category => (
+          {!focusRegion && visibleCategories.map(category => (
             <div key={category.name}>
               <div className="mb-1.5 text-[9px] uppercase tracking-widest font-bold text-stone-500">{category.name}</div>
               <div className="flex flex-wrap gap-1.5">
@@ -1826,16 +2134,56 @@ const TagEditor = ({
             </div>
           ))}
         </div>
-        <div className="p-3 border-t border-black/5 dark:border-white/5 space-y-2">
-          <div className="grid grid-cols-2 gap-2">
-            <button onClick={onClearMetadata} className="h-9 rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200/70 dark:border-amber-800/40 text-amber-800 dark:text-amber-200 text-[10px] font-bold">
-              清除标签与定位
-            </button>
-            <button onClick={onRemove} className="h-9 flex items-center justify-center gap-1.5 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200/70 dark:border-red-800/40 text-red-700 dark:text-red-300 text-[10px] font-bold">
-              <Trash2 size={12} /> 移除照片
-            </button>
-          </div>
-          <button onClick={handleSave} className="w-full py-2.5 rounded-xl bg-stone-900 dark:bg-zinc-100 text-white dark:text-zinc-900 text-xs font-bold">保存标签</button>
+        <div className="p-3 border-t border-black/5 dark:border-white/5 space-y-2 bg-stone-50 dark:bg-zinc-900 shrink-0">
+          {focusRegion ? (
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={onViewOriginal} className="h-9 rounded-xl bg-black/5 dark:bg-white/5 text-stone-700 dark:text-zinc-200 text-[10px] font-bold hover:bg-black/10 transition-colors cursor-pointer">
+                查看原图
+              </button>
+              <button onClick={onLocateOriginal} className="h-9 flex items-center justify-center gap-1.5 rounded-xl bg-stone-900 dark:bg-zinc-100 text-white dark:text-zinc-900 text-[10px] font-bold cursor-pointer">
+                在图库中定位原图
+              </button>
+            </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-3 gap-1.5">
+                <button
+                  type="button"
+                  onClick={onClearTags}
+                  className="h-8 flex items-center justify-center gap-1 rounded-xl bg-black/[0.035] dark:bg-white/[0.05] hover:bg-black/[0.07] dark:hover:bg-white/[0.09] text-stone-700 dark:text-zinc-300 text-[10px] font-bold transition-all active:scale-98 cursor-pointer"
+                  title="清空分类标签，保留姿势与定位"
+                >
+                  <Tags size={12} className="opacity-70" />
+                  <span>清除标签</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={onClearLocalization}
+                  className="h-8 flex items-center justify-center gap-1 rounded-xl bg-black/[0.035] dark:bg-white/[0.05] hover:bg-black/[0.07] dark:hover:bg-white/[0.09] text-stone-700 dark:text-zinc-300 text-[10px] font-bold transition-all active:scale-98 cursor-pointer"
+                  title="清空姿势与切片定位，保留标签"
+                >
+                  <Crosshair size={12} className="opacity-70" />
+                  <span>清除定位</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={onRemove}
+                  className="h-8 flex items-center justify-center gap-1 rounded-xl bg-red-500/10 hover:bg-red-500/15 text-red-600 dark:text-red-400 text-[10px] font-bold transition-all active:scale-98 cursor-pointer"
+                  title="从图库和本地永久删除图片"
+                >
+                  <Trash2 size={12} className="opacity-80" />
+                  <span>移除照片</span>
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={handleSave}
+                className="w-full h-9 rounded-xl bg-stone-900 dark:bg-zinc-100 text-white dark:text-zinc-900 text-xs font-bold shadow-sm hover:opacity-90 active:scale-[0.99] transition-all cursor-pointer"
+              >
+                保存标签
+              </button>
+            </>
+          )}
         </div>
       </motion.div>
     </motion.div>
@@ -1847,11 +2195,17 @@ const BatchTagEditor = ({
   customTagGroups = [],
   onClose,
   onApply,
+  onClearTags,
+  onClearLocalization,
+  onRemoveImages,
 }: {
   images: ImageRecord[];
   customTagGroups?: CustomTagGroup[];
   onClose: () => void;
   onApply: (tagsToAdd: string[], tagsToRemove: string[]) => void;
+  onClearTags: () => void;
+  onClearLocalization: () => void;
+  onRemoveImages: () => void;
 }) => {
   const [tagActions, setTagActions] = useState<Record<string, '+' | '-' | undefined>>({});
 
@@ -1978,7 +2332,7 @@ const BatchTagEditor = ({
               点击切换状态：+全部添加 / −全部移除 / 保持原样
             </div>
           </div>
-          <button onClick={onClose} className="w-7 h-7 flex items-center justify-center rounded-lg bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-colors">
+          <button onClick={onClose} className="w-7 h-7 flex items-center justify-center rounded-lg bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer">
             <X size={13} />
           </button>
         </div>
@@ -1987,7 +2341,7 @@ const BatchTagEditor = ({
         <div className="px-4 py-2 bg-black/[0.02] dark:bg-black/20 border-b border-black/5 dark:border-white/5 shrink-0 flex items-center gap-1.5 overflow-x-auto [&::-webkit-scrollbar]:hidden">
           {images.slice(0, 16).map(img => (
             <div key={img.id} className="w-8 h-10 rounded-md overflow-hidden bg-zinc-200 dark:bg-zinc-800 shrink-0 border border-black/5 dark:border-white/5 shadow-xs">
-              <img src={img.url} className="w-full h-full object-cover" alt="" loading="lazy" />
+              <img src={img.thumbnailUrl || img.url} className="w-full h-full object-cover" alt="" loading="lazy" />
             </div>
           ))}
           {images.length > 16 && (
@@ -2044,6 +2398,35 @@ const BatchTagEditor = ({
               {tagsToRemove.length > 0 && <span className="text-red-500 font-bold">将移除: {tagsToRemove.join('、')}</span>}
             </div>
           )}
+          <div className="grid grid-cols-3 gap-1.5">
+            <button
+              type="button"
+              onClick={onClearTags}
+              className="h-8 flex items-center justify-center gap-1 rounded-xl bg-black/[0.035] dark:bg-white/[0.05] hover:bg-black/[0.07] dark:hover:bg-white/[0.09] text-stone-700 dark:text-zinc-300 text-[10px] font-bold transition-all active:scale-98 cursor-pointer"
+              title="清空选中图片的分类标签，保留定位"
+            >
+              <Tags size={12} className="opacity-70" />
+              <span>清除标签</span>
+            </button>
+            <button
+              type="button"
+              onClick={onClearLocalization}
+              className="h-8 flex items-center justify-center gap-1 rounded-xl bg-black/[0.035] dark:bg-white/[0.05] hover:bg-black/[0.07] dark:hover:bg-white/[0.09] text-stone-700 dark:text-zinc-300 text-[10px] font-bold transition-all active:scale-98 cursor-pointer"
+              title="清空选中图片的姿势与切片定位，保留标签"
+            >
+              <Crosshair size={12} className="opacity-70" />
+              <span>清除定位</span>
+            </button>
+            <button
+              type="button"
+              onClick={onRemoveImages}
+              className="h-8 flex items-center justify-center gap-1 rounded-xl bg-red-500/10 hover:bg-red-500/15 text-red-600 dark:text-red-400 text-[10px] font-bold transition-all active:scale-98 cursor-pointer"
+              title="从图库和本地永久删除选中图片"
+            >
+              <Trash2 size={12} className="opacity-80" />
+              <span>移除照片</span>
+            </button>
+          </div>
           <div className="grid grid-cols-2 gap-2">
             <button
               type="button"

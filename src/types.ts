@@ -36,11 +36,11 @@ export interface AppSettings {
   flipAnimation: boolean;
   libraryThumbnailWidth: number;
   startAlwaysOnTop: boolean;
-  rememberWindowBounds: boolean;
-  windowBounds?: { x: number; y: number; width: number; height: number };
   shortcuts: PracticeShortcuts;
   customTagGroups: CustomTagGroup[];
   customTags: string[];
+  practiceContentTypes?: string[];
+  prioritizeUndrawnImages?: boolean;
 }
 
 export type BodyPartTag = '手' | '足' | '臂' | '腿' | '躯干' | '头部面部' | '骨盆臀部';
@@ -137,6 +137,7 @@ export interface PracticeConfig {
   singleTimeSec?: number; // for single
   imageCount?: number;    // for single
   progressiveStages?: StageConfig[]; // for progressive
+  folder?: string;        // restrict the pool to a library folder
 }
 
 export interface PracticeSet {

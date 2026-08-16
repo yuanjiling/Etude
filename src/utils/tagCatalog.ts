@@ -68,13 +68,16 @@ export const matchesBranchTags = (
   if (excludeTags && excludeTags.some(tag => itemTags.includes(tag))) return false;
   if (!includeTags || includeTags.length === 0) return true;
 
-  const allKnownGroupTags = new Set(categoryGroups.flatMap(group => group));
-  const customInclude = includeTags.filter(tag => !allKnownGroupTags.has(tag) && !CONTENT_TAGS.includes(tag as any));
+  const branchKnownTags = new Set(categoryGroups.flatMap(group => group));
+
+  // 仅将既不是内置原生标签、也不是模式分类标签的真正自定义标签作为全局包含检查
+  const customInclude = includeTags.filter(tag => !BUILTIN_TAGS.has(tag) && !CONTENT_TAGS.includes(tag as any));
   if (customInclude.length > 0 && !customInclude.every(tag => itemTags.includes(tag))) {
     return false;
   }
 
-  const relevantInclude = includeTags.filter(tag => categoryGroups.some(group => group.includes(tag)));
+  // 属于当前分支的包含标签
+  const relevantInclude = includeTags.filter(tag => branchKnownTags.has(tag));
   if (relevantInclude.length === 0) return true;
 
   const activeGroups = categoryGroups

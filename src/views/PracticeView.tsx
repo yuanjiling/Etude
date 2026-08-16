@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
-import { Play, Plus, ChevronDown, Check } from 'lucide-react';
-import { SessionType } from '../types';
+import { Play, Plus, ChevronDown, ChevronRight, Check, Folder, FolderTree } from 'lucide-react';
+import { AppSettings, ImageRecord, SessionType } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import { StageEditor } from '../components/StageEditor';
 import { SetEditorModal } from '../components/SetEditorModal';
@@ -19,6 +19,7 @@ import {
   GENERAL_REFERENCE_CATEGORIES,
   getSetDetailText,
 } from '../utils/tagCatalog';
+import { buildLibraryFolders, folderContains, folderDisplayName, type LibraryFolder } from '../utils/libraryFolders';
 
 const TIME_PRESETS = [0.5, 1, 2, 5, 10];
 const COUNT_PRESETS = [10, 20, 30, 50, 100];
@@ -51,9 +52,124 @@ const COMPACT_TAG_LABELS: Record<string, string> = {
   ...COMPACT_VISUAL_TAG_LABELS,
 };
 
+const computeInitialContentTypes = (settings: AppSettings, images: ImageRecord[]): string[] => {
+  const saved = settings.practiceContentTypes;
+  if (Array.isArray(saved)) {
+    return saved.filter(tag => (CONTENT_TAGS as readonly string[]).includes(tag));
+  }
+  const hasPersonClassification = images.some(image => (
+    image.contentRouting?.scope === 'human_dominant'
+    || image.tags.includes('完整人物')
+    || image.tags.includes('人体局部')
+  ));
+  return hasPersonClassification ? ['完整人物'] : [];
+};
+
+const expandableFolderPaths = (folders: LibraryFolder[]): Set<string> => {
+  const paths = new Set(folders.map(folder => folder.path));
+  const parents = new Set<string>();
+  folders.forEach(folder => {
+    if (folder.path.startsWith('__')) return;
+    const separator = folder.path.lastIndexOf('/');
+    if (separator > 0) {
+      const parent = folder.path.slice(0, separator);
+      if (paths.has(parent)) parents.add(parent);
+    }
+  });
+  return parents;
+};
+
+const PracticeFolderPicker: React.FC<{
+  folders: LibraryFolder[];
+  selected: string | null;
+  total: number;
+  onSelect: (folder: string | null) => void;
+  onClose: () => void;
+}> = ({ folders, selected, total, onSelect, onClose }) => {
+  const expandable = useMemo(() => expandableFolderPaths(folders), [folders]);
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(expandableFolderPaths(folders)));
+  const knownExpandable = useRef(new Set(expandable));
+
+  useEffect(() => {
+    const newlyExpandable = Array.from(expandable).filter(path => !knownExpandable.current.has(path));
+    if (newlyExpandable.length > 0) {
+      setCollapsed(current => new Set([...current, ...newlyExpandable]));
+      newlyExpandable.forEach(path => knownExpandable.current.add(path));
+    }
+  }, [expandable]);
+
+  const visibleFolders = useMemo(() => folders.filter(folder => {
+    if (folder.path.startsWith('__')) return true;
+    const segments = folder.path.split('/');
+    return segments.slice(0, -1).every((_, index) => !collapsed.has(segments.slice(0, index + 1).join('/')));
+  }), [collapsed, folders]);
+
+  const toggleFolder = (path: string) => {
+    setCollapsed(current => {
+      const next = new Set(current);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
+  return (
+    <div
+      onWheel={e => e.stopPropagation()}
+      className="max-h-60 overflow-y-auto p-1.5 overscroll-contain select-none [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-thumb]:bg-black/10 dark:[&::-webkit-scrollbar-thumb]:bg-white/10 [&::-webkit-scrollbar-thumb]:rounded-full"
+    >
+      <div className="flex h-7 items-center gap-1">
+        <button
+          onClick={() => { onSelect(null); onClose(); }}
+          className={`flex h-7 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-[10px] transition-colors ${selected === null ? 'bg-stone-800 font-bold text-white dark:bg-zinc-100 dark:text-zinc-900' : 'text-stone-600 hover:bg-black/5 dark:text-zinc-300 dark:hover:bg-white/5'}`}
+        >
+          <FolderTree size={12} className="shrink-0" />
+          <span className="flex-1 text-left">全部图包</span>
+          <span className="text-[8px] opacity-55">{total}</span>
+        </button>
+        {expandable.size > 0 && (
+          <button
+            onClick={() => setCollapsed(current => current.size > 0 ? new Set() : new Set(expandable))}
+            className="h-6 shrink-0 rounded-md px-2 text-[9px] font-bold text-stone-500 hover:bg-black/5 dark:hover:bg-white/5"
+          >
+            {collapsed.size > 0 ? '展开' : '折叠'}
+          </button>
+        )}
+      </div>
+      {visibleFolders.map(folder => {
+        const hasChildren = expandable.has(folder.path);
+        const isCollapsed = collapsed.has(folder.path);
+        const isSelected = selected === folder.path;
+        return (
+          <div
+            key={folder.path}
+            style={{ paddingLeft: `${folder.depth * 12}px` }}
+            className={`flex h-7 items-center rounded-md text-[10px] transition-colors ${isSelected ? 'bg-stone-800 font-bold text-white dark:bg-zinc-100 dark:text-zinc-900' : 'text-stone-600 hover:bg-black/5 dark:text-zinc-300 dark:hover:bg-white/5'}`}
+          >
+            <button
+              onClick={() => hasChildren && toggleFolder(folder.path)}
+              disabled={!hasChildren}
+              className="flex h-7 w-6 shrink-0 items-center justify-center disabled:opacity-20 cursor-pointer"
+              aria-label={hasChildren ? `${isCollapsed ? '展开' : '折叠'} ${folder.name}` : undefined}
+            >
+              {hasChildren ? (isCollapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />) : <span className="w-[11px]" />}
+            </button>
+            <button onClick={() => { onSelect(folder.path); onClose(); }} className="flex h-7 min-w-0 flex-1 items-center gap-2 pr-2 cursor-pointer">
+              <Folder size={12} fill="currentColor" className="shrink-0 opacity-55" />
+              <span className="flex-1 truncate text-left">{folder.name}</span>
+              <span className="text-[8px] opacity-55">{folder.count}</span>
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
 export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onStart }) => {
-  const { settings, images, sets, saveSet } = useAppContext();
-  const [includeTags, setIncludeTags] = useState<string[]>([]);
+  const { settings, images, sets, saveSet, updateSettings } = useAppContext();
+  const initialContentTypes = useMemo(() => computeInitialContentTypes(settings, images), []);
+  const [includeTags, setIncludeTags] = useState<string[]>(initialContentTypes);
   const [excludeTags, setExcludeTags] = useState<string[]>([]);
   const [sessionType, setSessionType] = useState<SessionType>('single');
   const [singleTimeMin, setSingleTimeMin] = useState<number | string>(1);
@@ -68,9 +184,23 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [activeSetId, setActiveSetId] = useState<string | null>(null);
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
-  const [activeContentPage, setActiveContentPage] = useState<(typeof CONTENT_TAGS)[number]>('完整人物');
+  const [activeFolder, setActiveFolder] = useState<string | null>(null);
+  const [showFolderPicker, setShowFolderPicker] = useState(false);
+  const [activeContentPage, setActiveContentPage] = useState<(typeof CONTENT_TAGS)[number]>(
+    initialContentTypes.length > 0 ? initialContentTypes[0] as (typeof CONTENT_TAGS)[number] : '完整人物',
+  );
 
   const isFilterDisabled = sessionType === 'progressive' && activeStageIdx === null;
+
+  const contentFilterReadyRef = useRef(false);
+  useEffect(() => {
+    if (!contentFilterReadyRef.current) {
+      contentFilterReadyRef.current = true;
+      return;
+    }
+    const contentTypes = includeTags.filter(tag => (CONTENT_TAGS as readonly string[]).includes(tag));
+    updateSettings({ practiceContentTypes: contentTypes });
+  }, [includeTags]);
 
   const activeIncludeTags = sessionType === 'progressive'
     ? (activeStageIdx !== null ? (progressiveStages[activeStageIdx]?.includeTags || []) : [])
@@ -80,16 +210,25 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
     : excludeTags;
 
   const selectedContentModes = activeIncludeTags.filter(t => CONTENT_TAGS.includes(t as any));
+  const isUnlimited = selectedContentModes.length === 0;
   const isFigureMode = selectedContentModes.length === 0 || selectedContentModes.includes('完整人物');
   const isPartMode = selectedContentModes.length === 0 || selectedContentModes.includes('人体局部');
   const isGeneralMode = selectedContentModes.length === 0 || selectedContentModes.includes('综合参考');
 
-  const matchingImagesCount = images.reduce((count, image) => {
+  const libraryFolders = useMemo(() => buildLibraryFolders(images), [images]);
+  const folderScopedImages = useMemo(
+    () => activeFolder ? images.filter(image => folderContains(activeFolder, image)) : images,
+    [images, activeFolder],
+  );
+
+  const matchingImagesCount = folderScopedImages.reduce((count, image) => {
     if (image.hidden) return count;
     let imageMatches = 0;
+    const isGeneralReference = image.tags.includes('综合参考') || image.contentRouting?.scope === 'general_reference';
+    const isClassifiedFigure = image.tags.includes('完整人物') || image.contentRouting?.scope === 'human_dominant';
 
     // 1. Full Figure Branch
-    if (isFigureMode && (image.tags.includes('完整人物') || image.contentRouting?.scope === 'human_dominant')) {
+    if (isFigureMode && (isClassifiedFigure || (selectedContentModes.length === 0 && !isGeneralReference))) {
       if (matchesBranchTags(image.tags, activeIncludeTags, activeExcludeTags, FIGURE_TAG_GROUPS)) {
         imageMatches += 1;
       }
@@ -169,11 +308,15 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
           stage.includeTags = [...stageInc, tag];
           stage.excludeTags = stageExc.filter((item: string) => item !== tag);
         }
-      } else if (stageExc.includes(tag)) {
-        stage.excludeTags = stageExc.filter((item: string) => item !== tag);
       } else {
-        stage.excludeTags = [...stageExc, tag];
-        stage.includeTags = stageInc.filter((item: string) => item !== tag);
+        // mode === 'exclude'：若已处于包含状态，右键等价于取消选中；若处于排除状态，右键取消排除；若未选中，右键加入排除
+        if (stageInc.includes(tag)) {
+          stage.includeTags = stageInc.filter((item: string) => item !== tag);
+        } else if (stageExc.includes(tag)) {
+          stage.excludeTags = stageExc.filter((item: string) => item !== tag);
+        } else {
+          stage.excludeTags = [...stageExc, tag];
+        }
       }
       stages[activeStageIdx] = stage;
       setProgressiveStages(stages);
@@ -186,10 +329,14 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
         : [...current, tag]);
       setExcludeTags(current => current.filter(item => item !== tag));
     } else {
-      setExcludeTags(current => current.includes(tag)
-        ? current.filter(item => item !== tag)
-        : [...current, tag]);
-      setIncludeTags(current => current.filter(item => item !== tag));
+      // mode === 'exclude'：若已处于包含状态，右键等价于取消选中；若处于排除状态，右键取消排除；若未选中，右键加入排除
+      if (activeIncludeTags.includes(tag)) {
+        setIncludeTags(current => current.filter(item => item !== tag));
+      } else if (activeExcludeTags.includes(tag)) {
+        setExcludeTags(current => current.filter(item => item !== tag));
+      } else {
+        setExcludeTags(current => [...current, tag]);
+      }
     }
     setActiveSetId(null);
   };
@@ -222,9 +369,12 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
       }
     } else {
       if (isSelected) {
+        const nextInclude = activeIncludeTags.filter(tag => tag !== content);
+        const nextExclude = activeExcludeTags.filter(tag => tag !== content);
+        const hasRemainingContentMode = nextInclude.some(tag => (CONTENT_TAGS as readonly string[]).includes(tag));
         replaceCurrentTags(
-          activeIncludeTags.filter(tag => tag !== content),
-          activeExcludeTags.filter(tag => tag !== content),
+          hasRemainingContentMode ? nextInclude : [],
+          hasRemainingContentMode ? nextExclude : [],
         );
       } else {
         replaceCurrentTags(
@@ -235,10 +385,33 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
     }
   };
 
+  const selectUnlimited = () => {
+    if (isFilterDisabled) return;
+    replaceCurrentTags([], []);
+  };
+
   const togglePersonCount = (countTag: string, mode: 'include' | 'exclude') => {
     if (isFilterDisabled) return;
     if (sessionType === 'progressive' && activeStageIdx !== null) {
       toggleTag(countTag, mode);
+      return;
+    }
+
+    if (mode === 'exclude' && activeIncludeTags.includes(countTag)) {
+      // 若已包含该人数标签，右键等价于取消选中
+      const nextInclude = activeIncludeTags.filter(tag => tag !== countTag);
+      const hasMultiPerson = nextInclude.some(tag => ['双人', '群体'].includes(tag));
+      const hasSinglePerson = nextInclude.includes('单人');
+      const nextVisibleGenders = hasMultiPerson 
+        ? MULTI_GENDER_TAGS 
+        : (hasSinglePerson ? SINGLE_GENDER_TAGS : [...SINGLE_GENDER_TAGS, ...MULTI_GENDER_TAGS]);
+      const filteredInclude = nextInclude.filter(t => 
+        (!SINGLE_GENDER_TAGS.includes(t) && !MULTI_GENDER_TAGS.includes(t)) || nextVisibleGenders.includes(t)
+      );
+      const filteredExclude = activeExcludeTags.filter(t =>
+        (!SINGLE_GENDER_TAGS.includes(t) && !MULTI_GENDER_TAGS.includes(t)) || nextVisibleGenders.includes(t)
+      );
+      replaceCurrentTags(filteredInclude, filteredExclude);
       return;
     }
 
@@ -357,6 +530,7 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
       singleTimeSec: 0,
       imageCount: 999,
       randomize: true,
+      folder: activeFolder || undefined,
       preparationSec: settings.preparationSec,
       transitionSec: settings.transitionSec
     });
@@ -364,12 +538,13 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
 
   const handleStart = () => {
     onStart({
-      includeTags,
-      excludeTags,
+      includeTags: sessionType === 'progressive' ? [] : includeTags,
+      excludeTags: sessionType === 'progressive' ? [] : excludeTags,
       sessionType,
       singleTimeSec: sessionType === 'single' && !isTimeLimited ? 0 : Math.floor(Number(singleTimeMin) * 60),
       imageCount: sessionType === 'single' && !isCountLimited ? 999 : Number(imageCount),
       progressiveStages: sessionType === 'progressive' ? progressiveStages : undefined,
+      folder: activeFolder || undefined,
       randomize: true,
       preparationSec: settings.preparationSec,
       transitionSec: settings.transitionSec
@@ -502,10 +677,51 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
             <div>
               <h2 className="text-[13px] font-bold">内容筛选</h2>
               <div className="text-[9px] text-stone-500/70">
-                {isFilterDisabled ? '请在上方选择阶段进行配置' : '左键包含 · 右键排除'}
+                {isFilterDisabled ? '请在上方选择阶段进行配置' : isUnlimited ? '已选「不限」· 下方筛选已停用' : '左键包含 · 右键排除'}
               </div>
             </div>
             <div className="flex items-center gap-2">
+              <div className="relative">
+                <button
+                  onClick={() => setShowFolderPicker(value => !value)}
+                  className={`flex h-6 items-center gap-1 rounded-md px-2 text-[9px] font-bold transition-colors ${activeFolder ? 'bg-stone-800 dark:bg-zinc-100 text-white dark:text-zinc-900' : 'bg-black/5 dark:bg-white/5 text-stone-500 hover:text-stone-800 dark:hover:text-zinc-200'}`}
+                  title="选择图包筛选范围"
+                >
+                  <FolderTree size={12} className="shrink-0" />
+                  <span className="max-w-24 truncate">{activeFolder ? folderDisplayName(activeFolder) : '全部图包'}</span>
+                  <ChevronDown size={10} className={`shrink-0 transition-transform ${showFolderPicker ? 'rotate-180' : ''}`} />
+                </button>
+                <AnimatePresence>
+                  {showFolderPicker && (
+                    <>
+                      <div
+                        className="fixed inset-0 z-40"
+                        onClick={() => setShowFolderPicker(false)}
+                        onWheel={e => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                        }}
+                      />
+                      <motion.div
+                        initial={{ opacity: 0, y: -4, scale: 0.98 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, y: -4, scale: 0.98 }}
+                        transition={{ duration: 0.15 }}
+                        onWheel={e => e.stopPropagation()}
+                        className="absolute right-0 top-7 z-50 w-52 sm:w-60 rounded-xl border border-black/10 bg-white/95 shadow-2xl backdrop-blur-xl dark:border-white/10 dark:bg-zinc-800/95 overscroll-contain"
+                      >
+                        <PracticeFolderPicker
+                          folders={libraryFolders}
+                          selected={activeFolder}
+                          total={images.length}
+                          onSelect={setActiveFolder}
+                          onClose={() => setShowFolderPicker(false)}
+                        />
+                      </motion.div>
+                    </>
+                  )}
+                </AnimatePresence>
+              </div>
               {!isFilterDisabled && (activeIncludeTags.length > 0 || activeExcludeTags.length > 0) && (
                 <button onClick={() => replaceCurrentTags([], [])} className="text-[9px] font-bold text-stone-500 hover:text-stone-800 dark:hover:text-zinc-200">清除筛选</button>
               )}
@@ -518,13 +734,31 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
           </div>
           <div className="grid grid-cols-[38px_1fr] items-center gap-2">
             <div className="text-[10px] font-semibold text-stone-500">素材</div>
-            <div className="flex gap-1.5">
+            <div className="flex flex-wrap gap-1.5">
+              <button
+                onClick={selectUnlimited}
+                className={`relative min-w-[44px] px-2 py-1.5 rounded-md border text-[10px] font-bold transition-colors ${
+                  selectedContentModes.length === 0
+                    ? 'bg-white dark:bg-zinc-700 text-stone-900 dark:text-zinc-100 border-white/80 dark:border-white/10 shadow-[0_0_14px_rgba(255,255,255,0.95),0_2px_8px_rgba(0,0,0,0.10)] dark:shadow-[0_0_14px_rgba(255,255,255,0.18)]'
+                    : 'bg-white/35 dark:bg-transparent border-black/10 dark:border-white/10 text-stone-500 dark:text-zinc-400'
+                }`}
+              >
+                不限
+              </button>
               {CONTENT_TAGS.map(content => (
                 <button
                   key={content}
                   onClick={() => selectContent(content)}
-                  className={`relative min-w-[72px] px-2 py-1.5 rounded-md border text-[10px] font-bold transition-colors ${
-                    activeContentPage === content
+                  onMouseDown={event => { if (event.button === 2) event.stopPropagation(); }}
+                  onContextMenu={event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (selectedContentModes.includes(content)) {
+                      selectContent(content);
+                    }
+                  }}
+                  className={`relative min-w-[72px] px-2 py-1.5 rounded-md border text-[10px] font-bold transition-colors cursor-pointer ${
+                    selectedContentModes.includes(content)
                       ? 'bg-white dark:bg-zinc-700 text-stone-900 dark:text-zinc-100 border-white/80 dark:border-white/10 shadow-[0_0_14px_rgba(255,255,255,0.95),0_2px_8px_rgba(0,0,0,0.10)] dark:shadow-[0_0_14px_rgba(255,255,255,0.18)]'
                       : 'bg-white/35 dark:bg-transparent border-black/10 dark:border-white/10 text-stone-600 dark:text-zinc-400'
                   }`}
@@ -535,6 +769,7 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
               ))}
             </div>
           </div>
+          <div className={`transition-all duration-200 ${isUnlimited ? 'opacity-40 pointer-events-none select-none grayscale-[20%]' : ''}`}>
           <AnimatePresence mode="wait" initial={false}>
             {activeContentPage === '完整人物' ? (
               <motion.div key="figure-categories" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="grid grid-cols-2 gap-x-4 [@media(min-height:700px)]:gap-x-5">
@@ -583,6 +818,7 @@ export const PracticeView: React.FC<{ onStart: (config: any) => void }> = ({ onS
               </div>
             </motion.div>
           )}
+          </div>
         </div>
 
         <motion.button

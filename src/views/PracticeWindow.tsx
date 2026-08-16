@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Play, Pause, ChevronRight, ChevronLeft, X, TimerReset, Check, Lock, Unlock, Snowflake, Focus } from 'lucide-react';
 import { CircularTimer } from '../components/CircularTimer';
@@ -8,6 +8,7 @@ import { useAppContext } from '../context/AppContext';
 import { POSE_MODEL_VERSION } from '../services/poseFocus';
 import type { FocusRegion, ImageRecord } from '../types';
 import {
+  BODY_PART_TAGS,
   CONTENT_TAGS,
   FIGURE_TAG_GROUPS,
   PART_TAG_GROUPS,
@@ -16,7 +17,8 @@ import {
   FILTER_TAG_GROUPS,
 } from '../utils/tagCatalog';
 import { getVirtualFocusTags } from '../utils/focusRegion';
-import { weightedPracticeShuffle } from '../utils/practiceSampling';
+import { folderContains, folderDisplayName } from '../utils/libraryFolders';
+import { samplePracticePool } from '../utils/practiceSampling';
 import { playTickSound, playFinishSound } from '../utils/sound';
 import { shortcutFromKeyboardEvent, type PracticeShortcutAction } from '../utils/shortcuts';
 
@@ -30,6 +32,59 @@ const formatCountdown = (totalSeconds: number) => {
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = seconds % 60;
   return `${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`;
+};
+
+const buildEmptyReason = (config: any, images: ImageRecord[]): string => {
+  let visibleImages = images.filter(image => !image.hidden);
+  if (visibleImages.length === 0) {
+    return '图库为空：请先在“设置 → 图库与识别”中选择并导入图片。';
+  }
+
+  if (config.folder) {
+    const folderScoped = visibleImages.filter(image => folderContains(config.folder, image));
+    if (folderScoped.length === 0) {
+      return `所选图包“${folderDisplayName(config.folder)}”中没有图片，请选择其他图包。`;
+    }
+    visibleImages = folderScoped;
+  }
+
+  const requested = new Set<string>();
+  if (config.sessionType === 'progressive') {
+    (config.progressiveStages || []).forEach((stage: any) => {
+      (stage.includeTags || []).forEach((tag: string) => requested.add(tag));
+    });
+  } else {
+    (config.includeTags || []).forEach((tag: string) => requested.add(tag));
+  }
+
+  const wantsFigure = requested.has('完整人物');
+  const wantsPart = requested.has('人体局部') || (BODY_PART_TAGS as readonly string[]).some(tag => requested.has(tag));
+  const wantsGeneral = requested.has('综合参考');
+  const hasContentFilter = wantsFigure || wantsPart || wantsGeneral;
+
+  const classifiedCount = visibleImages.filter(image => (
+    image.contentRouting?.scope === 'human_dominant'
+    || image.contentRouting?.scope === 'general_reference'
+    || image.tags.includes('完整人物')
+    || image.tags.includes('人体局部')
+    || image.tags.includes('综合参考')
+  )).length;
+
+  if (hasContentFilter && classifiedCount === 0) {
+    return '分类尚未完成：图库素材还没有完成内容识别，请先在“图库”中点击“分析素材内容”。';
+  }
+
+  if (wantsPart) {
+    const hasPartSource = visibleImages.some(image => (
+      image.tags.includes('人体局部')
+      || (image.poseAnalysis?.status === 'detected' && image.poseAnalysis.regions.length > 0)
+    ));
+    if (!hasPartSource) {
+      return '局部尚未定位：还没有可用的局部素材，请先在“图库”中对人物完成“定位局部”。';
+    }
+  }
+
+  return '没有符合标签：没有匹配当前筛选条件的素材，请调整筛选标签或选择“不限”。';
 };
 import { listen } from '@tauri-apps/api/event';
 import {
@@ -88,15 +143,29 @@ export const PracticeWindow: React.FC<{
   const [isBuildingPlaylist, setIsBuildingPlaylist] = useState(true);
   const [playlistBuildError, setPlaylistBuildError] = useState<string | null>(null);
   
+  const prepSec = Math.max(0, Number(config?.preparationSec ?? settings.preparationSec ?? 0));
   const [timeLeft, setTimeLeft] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
   const [isFrozen, setIsFrozen] = useState(false);
-  const [isPreparing, setIsPreparing] = useState(true);
-  const [prepTimeLeft, setPrepTimeLeft] = useState(config.preparationSec);
+  const [isPreparing, setIsPreparing] = useState(prepSec > 0);
+  const [prepTimeLeft, setPrepTimeLeft] = useState(prepSec);
   const [uiVisible, setUiVisible] = useState(true);
   const [canvasView, setCanvasView] = useState({ x: 0, y: 0, scale: 1 });
+  const [homeView, setHomeView] = useState({ x: 0, y: 0, scale: 1 });
   const [isDraggingCanvas, setIsDraggingCanvas] = useState(false);
   const canvasViewRef = useRef(canvasView);
+  const canvasSurfaceRef = useRef<HTMLDivElement>(null);
+  const [surfaceSize, setSurfaceSize] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    const surface = canvasSurfaceRef.current;
+    if (!surface) return;
+    const update = () => setSurfaceSize({ width: surface.clientWidth, height: surface.clientHeight });
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(surface);
+    return () => observer.disconnect();
+  }, [isBuildingPlaylist, playlist.length]);
   const canvasDragRef = useRef<{
     pointerId: number;
     startX: number;
@@ -113,18 +182,78 @@ export const PracticeWindow: React.FC<{
   const shortcutActionRef = useRef<(action: PracticeShortcutAction) => void>(() => undefined);
   const [reviewState, setReviewState] = useState<{ items: { image: ImageRecord; focusRegion?: FocusRegion }[], totalElapsedSec: number } | null>(null);
 
+  const currentItem = playlist[currentIndex];
+  const currentDuration = currentItem?.durationSec || 0;
+
+  const gridGeometry = useMemo(() => {
+    const image = currentItem?.image;
+    if (!image || surfaceSize.width <= 0 || surfaceSize.height <= 0) return null;
+    const naturalWidth = image.pixelWidth || 1;
+    const naturalHeight = image.pixelHeight || 1;
+    const containScale = Math.min(surfaceSize.width / naturalWidth, surfaceSize.height / naturalHeight);
+    const width = naturalWidth * containScale;
+    const height = naturalHeight * containScale;
+    const display = { left: (surfaceSize.width - width) / 2, top: (surfaceSize.height - height) / 2, width, height };
+    const density = Math.max(1, settings.gridDensity || 3);
+    const region = currentItem.focusRegion;
+    if (!region) {
+      return { ...display, cellWidth: width / density, cellHeight: height / density };
+    }
+    let regionWidth = region.width * width;
+    let regionHeight = region.height * height;
+    if (region.tag === '手' || region.tag === '足') {
+      const aspect = regionWidth / Math.max(regionHeight, 1);
+      if (aspect < 0.65) regionWidth = regionHeight * 0.65;
+      if (aspect > 1.5) regionHeight = regionWidth / 1.5;
+    }
+    return { ...display, cellWidth: regionWidth / density, cellHeight: regionHeight / density };
+  }, [surfaceSize, currentItem?.image?.id, currentItem?.focusRegion?.id, settings.gridDensity]);
+
   const updateCanvasView = (next: { x: number; y: number; scale: number }) => {
     canvasViewRef.current = next;
     setCanvasView(next);
   };
 
-  const resetCanvasView = () => updateCanvasView({ x: 0, y: 0, scale: 1 });
+  const frameRegion = (region: FocusRegion, image: ImageRecord, flipped: boolean): { x: number; y: number; scale: number } => {
+    const surface = canvasSurfaceRef.current;
+    const viewportWidth = surface?.clientWidth ?? surfaceSize.width;
+    const viewportHeight = surface?.clientHeight ?? surfaceSize.height;
+    const naturalWidth = image.pixelWidth || 1;
+    const naturalHeight = image.pixelHeight || 1;
+    if (!viewportWidth || !viewportHeight) return { x: 0, y: 0, scale: 1 };
+    const containScale = Math.min(viewportWidth / naturalWidth, viewportHeight / naturalHeight);
+    const displayedWidth = naturalWidth * containScale;
+    const displayedHeight = naturalHeight * containScale;
+    const left = (viewportWidth - displayedWidth) / 2;
+    const top = (viewportHeight - displayedHeight) / 2;
+    let regionWidth = region.width * displayedWidth;
+    let regionHeight = region.height * displayedHeight;
+    if (region.tag === '手' || region.tag === '足') {
+      const aspect = regionWidth / Math.max(regionHeight, 1);
+      if (aspect < 0.65) regionWidth = regionHeight * 0.65;
+      if (aspect > 1.5) regionHeight = regionWidth / 1.5;
+    }
+    const normalizedCenterX = region.x + region.width / 2;
+    const centerX = flipped
+      ? viewportWidth - (left + normalizedCenterX * displayedWidth)
+      : left + normalizedCenterX * displayedWidth;
+    const centerY = top + (region.y + region.height / 2) * displayedHeight;
+    const fitScale = Math.min(viewportWidth / Math.max(regionWidth, 1), viewportHeight / Math.max(regionHeight, 1));
+    const scale = Math.max(1, Math.min(8, fitScale * 0.5));
+    return {
+      x: viewportWidth / 2 - scale * centerX,
+      y: viewportHeight / 2 - scale * centerY,
+      scale,
+    };
+  };
 
-  useEffect(() => {
-    canvasDragRef.current = null;
-    setIsDraggingCanvas(false);
-    resetCanvasView();
-  }, [currentIndex]);
+  const applyFraming = (image: ImageRecord, region?: FocusRegion, flipped = false) => {
+    const next = region ? frameRegion(region, image, flipped) : { x: 0, y: 0, scale: 1 };
+    setHomeView(next);
+    updateCanvasView(next);
+  };
+
+  const resetCanvasView = () => updateCanvasView(homeView);
 
   const handleCanvasWheel = (event: React.WheelEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -191,11 +320,17 @@ export const PracticeWindow: React.FC<{
       const partItems: PlaylistItem[] = [];
       const generalItems: PlaylistItem[] = [];
 
+      const isUnlimited = selectedContentModes.length === 0;
+
       for (const image of images) {
         if (image.hidden) continue;
+        if (config.folder && !folderContains(config.folder, image)) continue;
+
+        const isGeneralReference = image.tags.includes('综合参考') || image.contentRouting?.scope === 'general_reference';
+        const isClassifiedFigure = image.tags.includes('完整人物') || image.contentRouting?.scope === 'human_dominant';
 
         // 1. Full Figure
-        if (isFigureMode && (image.tags.includes('完整人物') || image.contentRouting?.scope === 'human_dominant')) {
+        if (isFigureMode && (isClassifiedFigure || (isUnlimited && !isGeneralReference))) {
           if (matchesBranchTags(image.tags, includeTags, excludeTags, FIGURE_TAG_GROUPS)) {
             figureItems.push({ image, durationSec: 0 });
           }
@@ -230,7 +365,9 @@ export const PracticeWindow: React.FC<{
       }
 
       const combinedPool = [...figureItems, ...partItems, ...generalItems];
-      return config.randomize ? weightedPracticeShuffle(combinedPool) : combinedPool;
+      return config.randomize
+        ? samplePracticePool(combinedPool, settings.prioritizeUndrawnImages !== false)
+        : combinedPool;
     };
 
     const build = async () => {
@@ -255,8 +392,8 @@ export const PracticeWindow: React.FC<{
       } else if (config.sessionType === 'progressive' && config.progressiveStages) {
         for (let idx = 0; idx < config.progressiveStages.length; idx += 1) {
           const stage = config.progressiveStages[idx];
-          const stageInclude = [...(config.includeTags || []), ...(stage.includeTags || [])];
-          const stageExclude = [...(config.excludeTags || []), ...(stage.excludeTags || [])];
+          const stageInclude = [...(stage.includeTags || [])];
+          const stageExclude = [...(stage.excludeTags || [])];
           const stagePool = buildUnionPool(stageInclude, stageExclude);
           stagePool.slice(0, stage.count).forEach(item => {
             newPlaylist.push({ ...item, durationSec: stage.durationSec, stageIdx: idx });
@@ -289,8 +426,14 @@ export const PracticeWindow: React.FC<{
     };
   }, []);
 
-  const currentItem = playlist[currentIndex];
-  const currentDuration = currentItem?.durationSec || 0;
+  useEffect(() => {
+    canvasDragRef.current = null;
+    setIsDraggingCanvas(false);
+    if (currentItem?.image) {
+      applyFraming(currentItem.image, currentItem.focusRegion, settings.defaultFlip);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentIndex, currentItem?.image?.id, currentItem?.focusRegion?.id, surfaceSize]);
 
   // Timer logic
   useEffect(() => {
@@ -514,6 +657,15 @@ export const PracticeWindow: React.FC<{
       items: itemsToSave,
     });
     
+    // 进入练习回顾界面时，必须立即解除点击穿透锁定，恢复正常的鼠标点击交互
+    if (isClickThroughRef.current) {
+      if (isTauriEnvironment()) {
+        setPracticeLocked(false).catch(console.warn);
+      }
+      setIsClickThrough(false);
+      isClickThroughRef.current = false;
+    }
+    
     // Show review screen
     setReviewState({ items: itemsToSave, totalElapsedSec: Math.max(0, realElapsedSec) });
   };
@@ -529,27 +681,43 @@ export const PracticeWindow: React.FC<{
 
   if (playlist.length === 0) {
     return (
-      <div className={`absolute inset-0 z-50 flex flex-col items-center justify-center text-white sm:rounded-3xl ${isClickThrough ? 'bg-transparent' : 'bg-zinc-900'}`}>
+      <div className="absolute inset-0 z-50 flex flex-col items-center justify-center text-white sm:rounded-3xl bg-zinc-900 select-none p-6">
         <p className="text-lg font-medium mb-2">没有找到符合条件的图片</p>
         {playlistBuildError && <p className="max-w-72 mb-6 text-center text-xs text-red-300/80">{playlistBuildError}</p>}
-        {!playlistBuildError && <p className="max-w-72 mb-6 text-center text-xs text-white/45">请先在图库中完成“定位局部”，或导入带有人体局部标签的图片</p>}
-        <button onClick={onExit} className="px-6 py-3 bg-white text-black rounded-2xl font-bold">返回</button>
+        {!playlistBuildError && <p className="max-w-80 mb-6 text-center text-xs leading-relaxed text-white/55">{buildEmptyReason(config, images)}</p>}
+        <button
+          type="button"
+          onClick={onExit}
+          className="px-6 py-2.5 bg-white text-black hover:bg-stone-200 active:scale-95 transition-all rounded-xl font-bold text-sm cursor-pointer shadow-lg"
+        >
+          返回
+        </button>
+      </div>
+    );
+  }
+
+  if (!currentItem || !currentItem.image) {
+    return (
+      <div className="w-full h-full flex flex-col items-center justify-center bg-[#09090b] text-white">
+        <div className="w-7 h-7 mb-4 rounded-full border-2 border-white/20 border-t-white animate-spin" />
+        <p className="text-sm font-medium">正在载入图片…</p>
       </div>
     );
   }
 
   const progress = currentDuration > 0 ? timeLeft / currentDuration : 1;
-  const isCanvasModified = canvasView.scale !== 1 || Math.abs(canvasView.x) > 1 || Math.abs(canvasView.y) > 1;
+  const isCanvasModified = canvasView.scale !== homeView.scale
+    || Math.abs(canvasView.x - homeView.x) > 1
+    || Math.abs(canvasView.y - homeView.y) > 1;
 
   return (
-    <div className="absolute inset-0 z-50 text-white overflow-hidden flex items-center justify-center select-none rounded-2xl border border-white/5 bg-transparent">
-      
-      {/* Unified Practice Canvas Layer (Dark Background + Reference Image + Grid + Film Grain) */}
+    <div ref={canvasSurfaceRef} className="w-full h-full relative z-50 text-white overflow-hidden flex items-center justify-center select-none rounded-2xl border border-white/5 bg-transparent">
+      {/* 练习画布层：未锁定时展示深色实体背景，锁定时透明化背景 */}
       <div 
         className="absolute inset-0 pointer-events-none transition-opacity duration-300"
-        style={{ opacity: settings.canvasOpacity / 100 }}
+        style={{ opacity: (settings.canvasOpacity ?? 100) / 100 }}
       >
-        {/* Canvas Dark Backdrop */}
+        {/* 未锁定时展示深色背景，锁定时透明化 */}
         {!isClickThrough && (
           <div className="absolute inset-0 bg-[#09090b]" />
         )}
@@ -571,14 +739,30 @@ export const PracticeWindow: React.FC<{
             <FocusedPracticeImage
               key={`${currentItem.image.id}:${currentItem.focusRegion?.id || 'full'}`}
               image={currentItem.image}
-              region={currentItem.focusRegion}
               flipped={isFlipped}
               grayscale={isGrayscale}
               animateFlip={settings.flipAnimation}
             />
           </AnimatePresence>
 
-          {isGridEnabled && (
+          {isGridEnabled && currentItem.focusRegion && gridGeometry && (
+            <div
+              className="absolute pointer-events-none mix-blend-difference"
+              style={{
+                left: gridGeometry.left,
+                top: gridGeometry.top,
+                width: gridGeometry.width,
+                height: gridGeometry.height,
+                opacity: settings.gridOpacity / 100,
+                transform: isFlipped ? 'scaleX(-1)' : undefined,
+                transformOrigin: 'center center',
+                backgroundImage: `linear-gradient(to right, ${settings.gridColor} ${settings.gridLineWidth}px, transparent ${settings.gridLineWidth}px), linear-gradient(to bottom, ${settings.gridColor} ${settings.gridLineWidth}px, transparent ${settings.gridLineWidth}px)`,
+                backgroundSize: `${gridGeometry.cellWidth}px ${gridGeometry.cellHeight}px`,
+                backgroundPosition: '0 0',
+              }}
+            />
+          )}
+          {isGridEnabled && !currentItem.focusRegion && (
             <div 
               className="absolute inset-0 pointer-events-none mix-blend-difference" 
               style={{
@@ -745,8 +929,8 @@ export const PracticeWindow: React.FC<{
                   whileTap={{ scale: 0.95 }}
                   title={
                     isCanvasModified
-                      ? `复位画面视角 (${Math.round(canvasView.scale * 100)}% · 点击居中) · 双击画布也可复位`
-                      : '复位画面视角 (已居中 100%)'
+                      ? `复位画面视角 (${Math.round(canvasView.scale * 100)}% · 点击复位) · 双击画布也可复位`
+                      : `复位画面视角 (初始取景 ${Math.round(homeView.scale * 100)}%)`
                   }
                   aria-label="复位画面视角"
                 >
@@ -821,7 +1005,7 @@ export const PracticeWindow: React.FC<{
             onExit={onExit}
             onContinueDrawing={(image, region) => {
               setOriginalReviewState(reviewState);
-              resetCanvasView();
+              applyFraming(image, region, isFlipped);
               setPlaylist([{ image, durationSec: 1, focusRegion: region }]);
               setCurrentIndex(0);
               setTimeLeft(1);

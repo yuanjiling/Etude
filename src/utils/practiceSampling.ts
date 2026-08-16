@@ -29,3 +29,39 @@ export const weightedPracticeShuffle = <T extends ImageRecord | { image: ImageRe
     .sort((left, right) => left.key - right.key)
     .map(wrap => wrap.entry);
 };
+
+export const samplePracticePool = <T extends ImageRecord | { image: ImageRecord }>(
+  items: T[],
+  prioritizeUndrawn: boolean = true
+): T[] => {
+  if (!prioritizeUndrawn || items.length <= 1) {
+    return weightedPracticeShuffle(items);
+  }
+
+  const undrawn: T[] = [];
+  const drawn: T[] = [];
+
+  for (const entry of items) {
+    const record: ImageRecord = 'image' in entry && (entry as any).image ? (entry as any).image : (entry as ImageRecord);
+    if (!record.practice_count || record.practice_count <= 0) {
+      undrawn.push(entry);
+    } else {
+      drawn.push(entry);
+    }
+  }
+
+  // 若全部都是已画过或全部都是未画过，直接进行加权随机
+  if (undrawn.length === 0) {
+    return weightedPracticeShuffle(drawn);
+  }
+  if (drawn.length === 0) {
+    return weightedPracticeShuffle(undrawn);
+  }
+
+  // 优先排布未画过的素材；当需求量超过未画过的素材总数时，顺延从已画过（加权随机）中补充
+  return [
+    ...weightedPracticeShuffle(undrawn),
+    ...weightedPracticeShuffle(drawn),
+  ];
+};
+
