@@ -562,10 +562,7 @@ export const SettingsView = ({ onLocateImage }: { onLocateImage?: (imageId: stri
                 </section>
 
                 <section className="space-y-2.5">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-[10px] font-bold tracking-wide text-stone-400 dark:text-zinc-500">标签管理</h3>
-                    <span className="text-[9px] text-stone-400">原生标签不可改动 · 支持自定义标签分组</span>
-                  </div>
+                  <h3 className="text-[10px] font-bold tracking-wide text-stone-400 dark:text-zinc-500">标签管理</h3>
 
                   <div className="rounded-xl border border-black/5 bg-white/60 p-3.5 space-y-3 dark:border-white/5 dark:bg-zinc-800/60">
                     {/* 自定义标签分组 */}
@@ -890,6 +887,40 @@ export const SettingsView = ({ onLocateImage }: { onLocateImage?: (imageId: stri
                     <div className="mt-1.5 text-[9px] text-stone-400">
                       局部定位 {!libraryStatus ? '检测中' : libraryStatus.localizationReady ? '可用' : '不可用'} · 自动打标 {!libraryStatus ? '检测中' : libraryStatus.taggingReady ? '可用' : '未安装（可选）'}
                     </div>
+                    <div className="mt-3 space-y-3 rounded-lg bg-black/[0.025] p-2.5 dark:bg-black/20">
+                      <div>
+                        <div className="mb-1.5">
+                          <span className="text-[10px] font-bold text-stone-700 dark:text-zinc-200">推理性能</span>
+                        </div>
+                        <div className="grid grid-cols-3 gap-1 rounded-lg bg-black/[0.04] p-1 dark:bg-white/[0.04]">
+                          {([
+                            { value: 'responsive', label: '流畅', hint: '优先界面响应' },
+                            { value: 'balanced', label: '平衡', hint: '默认推荐' },
+                            { value: 'maximum', label: '极速', hint: '优先处理速度' },
+                          ] as const).map(option => (
+                            <button
+                              type="button"
+                              key={option.value}
+                              onClick={() => updateSettings({ inferencePerformance: option.value })}
+                              title={option.hint}
+                              className={`h-7 rounded-md text-[9px] font-bold transition-colors ${settings.inferencePerformance === option.value
+                                ? 'bg-white text-stone-900 shadow-sm dark:bg-zinc-700 dark:text-zinc-100'
+                                : 'text-stone-400 hover:text-stone-700 dark:text-zinc-500 dark:hover:text-zinc-300'}`}
+                            >
+                              {option.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="text-[10px] font-bold text-stone-700 dark:text-zinc-200">GPU 推理</div>
+                        <SettingSwitch
+                          checked={settings.gpuInferenceEnabled}
+                          onChange={() => updateSettings({ gpuInferenceEnabled: !settings.gpuInferenceEnabled })}
+                          label="GPU 推理"
+                        />
+                      </div>
+                    </div>
                     <div className="mt-3 flex items-center gap-1">
                       <button onClick={refreshModelStatus} disabled={isCheckingModel} className="h-7 rounded-md px-2 text-[9px] font-bold text-stone-500 hover:bg-black/5 disabled:opacity-40 dark:hover:bg-white/5">
                         {isCheckingModel ? '检测中…' : '重新检测'}
@@ -905,7 +936,7 @@ export const SettingsView = ({ onLocateImage }: { onLocateImage?: (imageId: stri
                       {libraryStatus?.taggerPath || '正在读取…'}
                     </div>
                     <div className="mt-2 text-[9px] leading-relaxed text-stone-400">
-                      此目录固定为软件目录下的 model/tagger-component。将独立组件包中的 runtime 与 model 文件夹放入这里，然后点击“重新检测”即可检测。
+                      将tagger-component放入model文件夹后，点击重新检测即可
                     </div>
                     {modelError && <div className="mt-2 text-[9px] leading-relaxed text-red-500">检测失败：{modelError}</div>}
                     {libraryStatus?.taggingError && (

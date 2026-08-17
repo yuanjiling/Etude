@@ -1,5 +1,6 @@
 import type { NormalizedLandmark, PoseLandmarker } from '@mediapipe/tasks-vision';
 import type { BodyPartTag, FocusRegion, PoseAnalysis } from '../types';
+import type { InferenceRunOptions } from '../utils/inference';
 
 export const POSE_MODEL_VERSION = 'mediapipe-pose-lite-f16-v6-compact-torso';
 
@@ -18,28 +19,41 @@ const GROUPS = [
   { id: 'right_foot', tag: '足', indices: [28, 30, 32], paddingX: 1, paddingY: 0.85, bottomExtension: 0.4, minPoints: 2, minSize: 0.055 },
 ] as const;
 
-let landmarkerPromise: Promise<PoseLandmarker> | null = null;
+type LandmarkerRuntime = { landmarker: PoseLandmarker; backend: 'GPU' | 'CPU'; fallbackReason?: string };
+const landmarkerPromises = new Map<'gpu' | 'cpu', Promise<LandmarkerRuntime>>();
 
 const clamp = (value: number, min = 0, max = 1) => Math.min(max, Math.max(min, value));
 
-const getLandmarker = () => {
-  if (!landmarkerPromise) {
-    landmarkerPromise = import('@mediapipe/tasks-vision').then(async ({ FilesetResolver, PoseLandmarker }) => {
+const getLandmarker = (preferGpu: boolean) => {
+  const key = preferGpu ? 'gpu' : 'cpu';
+  let runtime = landmarkerPromises.get(key);
+  if (!runtime) {
+    runtime = import('@mediapipe/tasks-vision').then(async ({ FilesetResolver, PoseLandmarker }) => {
       const wasm = await FilesetResolver.forVisionTasks('/mediapipe');
-      return PoseLandmarker.createFromOptions(wasm, {
-        baseOptions: {
-          modelAssetPath: '/models/pose_landmarker_lite.task',
-          delegate: 'CPU',
-        },
-        runningMode: 'IMAGE',
-        numPoses: 6,
-        minPoseDetectionConfidence: 0.35,
-        minPosePresenceConfidence: 0.35,
-        outputSegmentationMasks: false,
-      });
+      const create = (delegate: 'GPU' | 'CPU') => PoseLandmarker.createFromOptions(wasm, {
+          baseOptions: { modelAssetPath: '/models/pose_landmarker_lite.task', delegate },
+          runningMode: 'IMAGE',
+          numPoses: 6,
+          minPoseDetectionConfidence: 0.35,
+          minPosePresenceConfidence: 0.35,
+          outputSegmentationMasks: false,
+        });
+      if (preferGpu) {
+        try {
+          return { landmarker: await create('GPU'), backend: 'GPU' as const };
+        } catch (error) {
+          return {
+            landmarker: await create('CPU'),
+            backend: 'CPU' as const,
+            fallbackReason: `姿势定位 GPU 初始化失败：${String(error)}`,
+          };
+        }
+      }
+      return { landmarker: await create('CPU'), backend: 'CPU' as const };
     });
+    landmarkerPromises.set(key, runtime);
   }
-  return landmarkerPromise;
+  return runtime;
 };
 
 const loadImage = (src: string) => new Promise<HTMLImageElement>((resolve, reject) => {
@@ -157,12 +171,26 @@ const keepSmallestRegionForTag = (
   return regions.filter(region => region.tag !== tag || region === smallest);
 };
 
-export const analyzePoseFocus = async (input: string | HTMLImageElement | ImageBitmap): Promise<PoseAnalysis> => {
-  const [landmarker, image] = await Promise.all([
-    getLandmarker(),
+export const analyzePoseFocus = async (
+  input: string | HTMLImageElement | ImageBitmap,
+  options: InferenceRunOptions,
+): Promise<PoseAnalysis> => {
+  let [runtime, image] = await Promise.all([
+    getLandmarker(options.preferGpu),
     typeof input === 'string' ? loadImage(input) : Promise.resolve(input),
   ]);
-  const result = landmarker.detect(image);
+  if (runtime.fallbackReason) options.onGpuFallback?.(runtime.fallbackReason);
+  let result;
+  try {
+    result = runtime.landmarker.detect(image);
+  } catch (error) {
+    if (runtime.backend !== 'GPU') throw error;
+    const fallbackReason = `姿势定位 GPU 执行失败：${String(error)}`;
+    options.onGpuFallback?.(fallbackReason);
+    runtime = { ...await getLandmarker(false), fallbackReason };
+    landmarkerPromises.set('gpu', Promise.resolve(runtime));
+    result = runtime.landmarker.detect(image);
+  }
   if (result.landmarks.length === 0) {
     return { modelVersion: POSE_MODEL_VERSION, status: 'not_found', regions: [] };
   }

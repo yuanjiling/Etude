@@ -205,27 +205,24 @@ export const PracticeWindow: React.FC<{
     const imageLeft = (surfaceSize.width - renderedWidth) / 2;
     const imageTop = (surfaceSize.height - renderedHeight) / 2;
     const focusFrame = region ? getFocusFrame(region, naturalWidth, naturalHeight) : null;
-    const baseCellWidth = (focusFrame ? focusFrame.width * containScale : renderedWidth) / density;
-    const baseCellHeight = (focusFrame ? focusFrame.height * containScale : renderedHeight) / density;
-    const focusLeft = focusFrame
-      ? (isFlipped
-        ? (naturalWidth - focusFrame.centerX - focusFrame.width / 2) * containScale
-        : (focusFrame.centerX - focusFrame.width / 2) * containScale)
-      : 0;
-    const focusTop = focusFrame ? (focusFrame.centerY - focusFrame.height / 2) * containScale : 0;
+    const baseCellSize = focusFrame
+      ? Math.min(surfaceSize.width, surfaceSize.height) / density / Math.max(homeView.scale, 0.001)
+      : Math.min(renderedWidth, renderedHeight) / density;
     const positiveModulo = (value: number, divisor: number) => ((value % divisor) + divisor) % divisor;
+    const left = canvasView.x + canvasView.scale * imageLeft;
+    const top = canvasView.y + canvasView.scale * imageTop;
+    const cellSize = baseCellSize * canvasView.scale;
 
     return {
-      left: canvasView.x + canvasView.scale * imageLeft,
-      top: canvasView.y + canvasView.scale * imageTop,
+      left,
+      top,
       width: renderedWidth * canvasView.scale,
       height: renderedHeight * canvasView.scale,
-      cellWidth: baseCellWidth * canvasView.scale,
-      cellHeight: baseCellHeight * canvasView.scale,
-      offsetX: positiveModulo(focusLeft, baseCellWidth) * canvasView.scale,
-      offsetY: positiveModulo(focusTop, baseCellHeight) * canvasView.scale,
+      cellSize,
+      offsetX: focusFrame ? positiveModulo(-left, cellSize) : 0,
+      offsetY: focusFrame ? positiveModulo(-top, cellSize) : 0,
     };
-  }, [surfaceSize, naturalImageSize, currentItem?.image?.id, currentItem?.image?.pixelWidth, currentItem?.image?.pixelHeight, currentItem?.focusRegion, canvasView, isFlipped, settings.gridDensity]);
+  }, [surfaceSize, naturalImageSize, currentItem?.image?.id, currentItem?.image?.pixelWidth, currentItem?.image?.pixelHeight, currentItem?.focusRegion, canvasView, homeView.scale, settings.gridDensity]);
 
   const updateCanvasView = (next: { x: number; y: number; scale: number }) => {
     canvasViewRef.current = next;
@@ -686,9 +683,18 @@ export const PracticeWindow: React.FC<{
     // Show review screen
     setReviewState({ items: itemsToSave, totalElapsedSec: Math.max(0, realElapsedSec) });
 
-    // 先让回顾层完成一帧绘制，再更新整套图库计数并写入历史。
+    // 等回顾层完成入场和首批卡片绘制，再利用空闲时段更新图库计数与历史。
     requestAnimationFrame(() => {
-      window.setTimeout(() => addHistory(historyRecord), 0);
+      requestAnimationFrame(() => {
+        const idleWindow = window as unknown as {
+          requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
+        };
+        if (idleWindow.requestIdleCallback) {
+          idleWindow.requestIdleCallback(() => addHistory(historyRecord), { timeout: 1500 });
+        } else {
+          globalThis.setTimeout(() => addHistory(historyRecord), 500);
+        }
+      });
     });
   };
 
@@ -785,7 +791,7 @@ export const PracticeWindow: React.FC<{
               height: gridGeometry.height,
               opacity: settings.gridOpacity / 100,
               backgroundImage: `linear-gradient(to right, ${settings.gridColor} ${settings.gridLineWidth}px, transparent ${settings.gridLineWidth}px), linear-gradient(to bottom, ${settings.gridColor} ${settings.gridLineWidth}px, transparent ${settings.gridLineWidth}px)`,
-              backgroundSize: `${gridGeometry.cellWidth}px ${gridGeometry.cellHeight}px`,
+              backgroundSize: `${gridGeometry.cellSize}px ${gridGeometry.cellSize}px`,
               backgroundPosition: `${gridGeometry.offsetX}px ${gridGeometry.offsetY}px`,
             }}
           />
@@ -996,7 +1002,7 @@ export const PracticeWindow: React.FC<{
         >
           {[
             { label: '复位视角', active: false, action: resetCanvasView },
-            { label: '九宫格', active: isGridEnabled, action: () => setIsGridEnabled(g => !g) },
+            { label: '网格', active: isGridEnabled, action: () => setIsGridEnabled(g => !g) },
             { label: '水平翻转', active: isFlipped, action: () => setIsFlipped(f => !f) },
             { label: '黑白滤镜', active: isGrayscale, action: () => setIsGrayscale(g => !g) },
           ].map(item => (

@@ -8,6 +8,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { isTauriEnvironment } from '../utils/tauriWindow';
 import { StartupSplash } from '../components/StartupSplash';
 import { setThumbnailSchedulerPaused } from '../services/thumbnailScheduler';
+import { inferenceProfile } from '../utils/inference';
 
 export type LibraryTaskState = {
   running: boolean;
@@ -81,6 +82,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   customTags: [],
   practiceContentTypes: undefined,
   prioritizeUndrawnImages: true,
+  inferencePerformance: 'balanced',
+  gpuInferenceEnabled: true,
 };
 
 const loadSettings = (stored: unknown): AppSettings => {
@@ -155,6 +158,31 @@ const applyAnalysisPatch = (images: ImageRecord[], updates: AnalysisUpdateItem[]
   });
 };
 
+const historyImageSnapshot = (image: ImageRecord): ImageRecord => ({
+  id: image.id,
+  url: image.url,
+  thumbnailUrl: image.thumbnailUrl,
+  sourcePath: image.sourcePath,
+  fileName: image.fileName,
+  pixelWidth: image.pixelWidth,
+  pixelHeight: image.pixelHeight,
+  tags: [],
+  practice_count: image.practice_count,
+  last_seen: image.last_seen,
+  favorite: image.favorite,
+  hidden: image.hidden,
+  skip_count: image.skip_count,
+});
+
+const compactHistoryRecord = (record: HistoryRecord): HistoryRecord => ({
+  ...record,
+  images: record.images.map(historyImageSnapshot),
+  items: record.items?.map(item => ({
+    image: historyImageSnapshot(item.image),
+    focusRegion: item.focusRegion,
+  })),
+});
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [isLoaded, setIsLoaded] = useState(false);
   const [images, setImages] = useState<ImageRecord[]>([]);
@@ -172,6 +200,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const cancelLocalizationRef = useRef(false);
   const lastUiInteractionRef = useRef(0);
   const persistenceEnabledRef = useRef(false);
+  const skipNextStatePersistenceRef = useRef(false);
   const latestStateRef = useRef({ images, archivedImages, sets, history, settings });
   latestStateRef.current = { images, archivedImages, sets, history, settings };
   const saveTimeoutRef = useRef<number | null>(null);
@@ -265,6 +294,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Save database-backed application data with Debounce + MaxWait (2.5s) throttle.
   useEffect(() => {
     if (!isLoaded || !persistenceEnabledRef.current) return;
+    if (skipNextStatePersistenceRef.current) {
+      skipNextStatePersistenceRef.current = false;
+      return;
+    }
     const now = Date.now();
     const timeSinceLastSave = now - lastSaveTimeRef.current;
 
@@ -499,14 +532,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     taggingRunningRef.current = true;
     cancelTaggingRef.current = false;
     setTaggingTask({ running: true, current: 0, total: queue.length });
+    const profile = inferenceProfile(settings.inferencePerformance);
     const applied = new Set<number>();
     let lastFlushTime = Date.now();
     let lastTaskTime = 0;
+    let runtimeMessage = '';
 
     try {
       const progress = new Channel<Record<string, unknown>>();
       progress.onmessage = message => {
         if (cancelTaggingRef.current) return;
+        if (message.type === 'runtime') {
+          const fallback = typeof message.gpuFallback === 'string' ? message.gpuFallback : '';
+          const provider = String(message.provider || 'CPUExecutionProvider');
+          runtimeMessage = fallback
+            ? `${fallback}，已自动使用 CPU`
+            : provider === 'CPUExecutionProvider' ? '自动打标正在使用 CPU' : `自动打标正在使用 GPU（${provider}）`;
+          setTaggingTask(current => ({ ...current, message: runtimeMessage }));
+          return;
+        }
         const current = Number(message.current) || 0;
         const now = Date.now();
         if (now - lastTaskTime >= 120 || current === queue.length) {
@@ -532,6 +576,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       };
       const results = await invoke<unknown[]>('auto_tag_images', {
         imagePaths: queue.map(image => image.sourcePath),
+        preferGpu: settings.gpuInferenceEnabled,
+        cpuThreads: profile.cpuThreads,
+        interImageDelayMs: profile.betweenImagesMs,
         onProgress: progress,
       });
       results.forEach((result, index) => {
@@ -552,7 +599,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         running: false,
         current: results.length,
         total: queue.length,
-        message: `已完成 ${results.length} 张图片的自动打标`,
+        message: [`已完成 ${results.length} 张图片的自动打标`, runtimeMessage].filter(Boolean).join(' · '),
       });
     } catch (error) {
       flushAnalysisUpdates();
@@ -575,6 +622,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     cancelLocalizationRef.current = false;
     setThumbnailSchedulerPaused(true);
     setLocalizationTask({ running: true, current: 0, total: queue.length });
+    const profile = inferenceProfile(settings.inferencePerformance);
+    const gpuFallbacks = new Set<string>();
+    const inferenceOptions = {
+      preferGpu: settings.gpuInferenceEnabled,
+      performance: settings.inferencePerformance,
+      onGpuFallback: (reason: string) => {
+        if (gpuFallbacks.has(reason)) return;
+        gpuFallbacks.add(reason);
+        setLocalizationTask(current => ({
+          ...current,
+          message: `${Array.from(gpuFallbacks).join('；')}，已自动使用 CPU`,
+        }));
+      },
+    };
     let completed = 0;
     let failed = 0;
     let regionCount = 0;
@@ -588,18 +649,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           return;
         }
         const quietFor = performance.now() - lastUiInteractionRef.current;
-        if (quietFor < 120) {
-          globalThis.setTimeout(waitUntilQuiet, Math.ceil(120 - quietFor));
+        if (quietFor < profile.interactionQuietMs) {
+          globalThis.setTimeout(waitUntilQuiet, Math.ceil(profile.interactionQuietMs - quietFor));
           return;
         }
-        const timeout = taggingRunningRef.current ? 500 : 240;
+        const timeout = taggingRunningRef.current
+          ? Math.max(500, profile.idleTimeoutMs)
+          : profile.idleTimeoutMs;
         if ('requestIdleCallback' in window) {
           window.requestIdleCallback(() => {
-            if (performance.now() - lastUiInteractionRef.current < 120) waitUntilQuiet();
+            if (performance.now() - lastUiInteractionRef.current < profile.interactionQuietMs) waitUntilQuiet();
             else resolve();
           }, { timeout });
         } else {
-          globalThis.setTimeout(resolve, taggingRunningRef.current ? 100 : 32);
+          globalThis.setTimeout(resolve, taggingRunningRef.current ? Math.max(100, profile.betweenImagesMs) : profile.betweenImagesMs);
         }
       };
       waitUntilQuiet();
@@ -611,7 +674,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         await waitForAnalysisSlot();
         if (shuttingDownRef.current || cancelLocalizationRef.current) break;
         try {
-          const analysis = await analyzeContent(image.url);
+          const analysis = await analyzeContent(image.url, inferenceOptions);
           const contentRouting = image.contentRouting?.manuallyCorrected
             ? {
               ...analysis.contentRouting,
@@ -650,7 +713,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
 
         // Yield to the main browser thread to allow UI rendering and smooth user interaction
-        await new Promise<void>(resolve => setTimeout(resolve, taggingRunningRef.current ? 48 : 12));
+        await new Promise<void>(resolve => setTimeout(
+          resolve,
+          taggingRunningRef.current ? Math.max(64, profile.betweenImagesMs) : profile.betweenImagesMs,
+        ));
       }
       flushAnalysisUpdates();
       void flushSave();
@@ -661,7 +727,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           total: queue.length,
           message: cancelLocalizationRef.current
             ? `已停止素材分析（完成 ${completed} 张${failed > 0 ? `，${failed} 张失败` : ''}）`
-            : `已分析 ${completed} 张图片，生成 ${regionCount} 个虚拟局部${failed > 0 ? `，${failed} 张失败` : ''}`,
+            : [
+              `已分析 ${completed} 张图片，生成 ${regionCount} 个虚拟局部${failed > 0 ? `，${failed} 张失败` : ''}`,
+              gpuFallbacks.size > 0 ? 'GPU 不可用，本次已使用 CPU' : settings.gpuInferenceEnabled ? 'GPU 推理' : 'CPU 推理',
+            ].join(' · '),
         });
       }
     } catch (error) {
@@ -726,6 +795,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const addHistory = (record: HistoryRecord) => {
+    const compactRecord = compactHistoryRecord(record);
     const practiceCounts = new Map<string, number>();
     record.images.forEach(image => {
       practiceCounts.set(image.id, (practiceCounts.get(image.id) || 0) + 1);
@@ -736,7 +806,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ? { ...image, practice_count: image.practice_count + increment, last_seen: record.date }
         : image;
     }));
-    setHistory(prev => [record, ...prev]);
+    const persistIncrementally = isTauriEnvironment();
+    if (persistIncrementally) skipNextStatePersistenceRef.current = true;
+    setHistory(prev => [compactRecord, ...prev]);
+    if (persistIncrementally) {
+      void invoke('append_practice_session', { data: JSON.stringify(compactRecord) }).catch(error => {
+        console.warn('Failed to append practice session:', error);
+        globalThis.setTimeout(() => { void flushSave(); }, 0);
+      });
+    }
   };
 
   const clearHistory = () => {

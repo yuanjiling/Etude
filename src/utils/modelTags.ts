@@ -7,6 +7,7 @@ const TAG_MAP: Record<string, string> = {
   full_body: '全身', body_crop: '身体裁切', portrait: '头肩肖像',
   standing: '站', sitting: '坐', kneeling: '跪', crouching: '蹲', lying: '躺',
   static: '静态', active: '动态',
+  no_props: '无道具', props: '有道具',
   eye_level: '平视', high_angle: '俯视', low_angle: '仰视',
   front: '正面', back: '背面', side: '纯侧面',
 };

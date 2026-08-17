@@ -4,7 +4,7 @@
   "offline_only": true,
   "network_required": false,
   "vision_only": true,
-  "runtime": "onnxruntime-cpu",
+  "runtime": "onnxruntime-directml-with-cpu-fallback",
   "precision": "fp16",
   "compact_multi": true,
   "single_view_policy": {

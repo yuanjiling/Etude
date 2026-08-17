@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -57,27 +58,77 @@ def decode_multilabel(values: np.ndarray, labels: list[str], thresholds: list[fl
 
 
 class OnnxTagger:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, prefer_gpu: bool, cpu_threads: int) -> None:
         self.root = root
         self.manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-        options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        options.intra_op_num_threads = 0
-        options.log_severity_level = 3
-        self.session = ort.InferenceSession(
-            root / self.manifest["assets"]["onnx_model"],
-            sess_options=options,
-            providers=["CPUExecutionProvider"],
-        )
+        self.cpu_threads = max(0, cpu_threads)
+        self.provider = "CPUExecutionProvider"
+        self.fallback_reason: str | None = None
+        self._runtime_notice_pending = True
+        self.session = self._create_session(prefer_gpu)
         self.input_dtype = (
             np.float16 if self.session.get_inputs()[0].type == "tensor(float16)" else np.float32
         )
 
-    def classify(self, path: Path) -> dict:
-        outputs = self.session.run(
-            OUTPUT_NAMES,
-            {"pixel_values": preprocess(path).astype(self.input_dtype, copy=False)},
+    def _session_options(self, provider: str) -> ort.SessionOptions:
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        options.intra_op_num_threads = self.cpu_threads
+        options.log_severity_level = 3
+        if provider == "DmlExecutionProvider":
+            options.enable_mem_pattern = False
+            options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        return options
+
+    def _open_session(self, provider: str) -> ort.InferenceSession:
+        providers = [provider]
+        if provider != "CPUExecutionProvider":
+            providers.append("CPUExecutionProvider")
+        return ort.InferenceSession(
+            self.root / self.manifest["assets"]["onnx_model"],
+            sess_options=self._session_options(provider),
+            providers=providers,
         )
+
+    def _create_session(self, prefer_gpu: bool) -> ort.InferenceSession:
+        available = set(ort.get_available_providers())
+        gpu_provider = next((provider for provider in (
+            "CUDAExecutionProvider", "DmlExecutionProvider", "CoreMLExecutionProvider"
+        ) if provider in available), None)
+        if prefer_gpu and gpu_provider:
+            try:
+                self.provider = gpu_provider
+                return self._open_session(gpu_provider)
+            except Exception as error:
+                self.fallback_reason = f"GPU 初始化失败：{error}"
+        elif prefer_gpu:
+            self.fallback_reason = "当前 ONNX Runtime 未提供可用的 GPU 执行器"
+        self.provider = "CPUExecutionProvider"
+        return self._open_session(self.provider)
+
+    def runtime_notice(self) -> dict | None:
+        if not self._runtime_notice_pending:
+            return None
+        self._runtime_notice_pending = False
+        return {
+            "type": "runtime",
+            "provider": self.provider,
+            "gpuFallback": self.fallback_reason,
+            "cpuThreads": self.cpu_threads,
+        }
+
+    def classify(self, path: Path) -> dict:
+        inputs = {"pixel_values": preprocess(path).astype(self.input_dtype, copy=False)}
+        try:
+            outputs = self.session.run(OUTPUT_NAMES, inputs)
+        except Exception as error:
+            if self.provider == "CPUExecutionProvider":
+                raise
+            self.fallback_reason = f"GPU 执行失败：{error}"
+            self.provider = "CPUExecutionProvider"
+            self._runtime_notice_pending = True
+            self.session = self._open_session(self.provider)
+            outputs = self.session.run(OUTPUT_NAMES, inputs)
         values = {name: output[0] for name, output in zip(OUTPUT_NAMES, outputs)}
         people = HEAD_SPACES["people"][int(values["people"].argmax())]
         view_values = values["view_single"] if people == "single" else values["view_multi"]
@@ -129,15 +180,26 @@ def main() -> int:
     parser.add_argument("--model-dir", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--prefer-gpu", action="store_true")
+    parser.add_argument("--cpu-threads", type=int, default=0)
+    parser.add_argument("--inter-image-delay-ms", type=int, default=0)
     args = parser.parse_args()
-    tagger = OnnxTagger(args.model_dir.resolve())
+    tagger = OnnxTagger(args.model_dir.resolve(), args.prefer_gpu, args.cpu_threads)
     paths = discover_images(args.input)
+    notice = tagger.runtime_notice()
+    if notice:
+        print(json.dumps(notice, ensure_ascii=False), flush=True)
     print(json.dumps({"type": "progress", "total": len(paths), "current": 0}), flush=True)
     results = []
     for index, path in enumerate(paths, 1):
         result = tagger.classify(path)
+        notice = tagger.runtime_notice()
+        if notice:
+            print(json.dumps(notice, ensure_ascii=False), flush=True)
         results.append(result)
         print(json.dumps({"type": "progress", "total": len(paths), "current": index, "result": result}, ensure_ascii=False), flush=True)
+        if args.inter_image_delay_ms > 0 and index < len(paths):
+            time.sleep(args.inter_image_delay_ms / 1000)
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     fields = ["source", *HEAD_SPACES]

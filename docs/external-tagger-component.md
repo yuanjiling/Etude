@@ -26,3 +26,5 @@ powershell -ExecutionPolicy Bypass -File scripts/package-tagger-component.ps1
 ```
 
 默认输出到 `release/model/tagger-component`。分发时将 `model` 目录放到 `Etude.exe` 同级位置。应用在用户点击“重新检测”时再次检测组件。
+
+Windows 运行时建议安装 `onnxruntime-directml`，以支持 NVIDIA、AMD 与 Intel 显卡。应用默认尝试 GPU，执行器初始化或推理失败时会提示原因并自动回退到 CPU。仅安装 `onnxruntime` 的旧组件仍可继续使用 CPU 推理。

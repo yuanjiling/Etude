@@ -830,6 +830,9 @@ use tauri::ipc::Channel;
 async fn auto_tag_images(
     app: tauri::AppHandle,
     image_paths: Vec<String>,
+    prefer_gpu: bool,
+    cpu_threads: u16,
+    inter_image_delay_ms: u64,
     on_progress: Channel<serde_json::Value>,
 ) -> Result<Vec<serde_json::Value>, String> {
     STOP_TAGGING.store(false, Ordering::SeqCst);
@@ -865,8 +868,15 @@ async fn auto_tag_images(
         .arg(&temp_dir)
         .arg("--output")
         .arg(&output_dir)
+        .arg("--cpu-threads")
+        .arg(cpu_threads.min(256).to_string())
+        .arg("--inter-image-delay-ms")
+        .arg(inter_image_delay_ms.min(1000).to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if prefer_gpu {
+        cmd.arg("--prefer-gpu");
+    }
 
     let mut child = cmd
         .spawn()
@@ -883,7 +893,10 @@ async fn auto_tag_images(
         }
         if let Ok(l) = line {
             if let Ok(progress) = serde_json::from_str::<serde_json::Value>(&l) {
-                if progress.get("type").and_then(|t| t.as_str()) == Some("progress") {
+                if matches!(
+                    progress.get("type").and_then(|t| t.as_str()),
+                    Some("progress" | "runtime")
+                ) {
                     let _ = on_progress.send(progress);
                 }
             }
@@ -956,6 +969,7 @@ pub fn run() {
             exit_app,
             database::read_app_state,
             database::write_app_state,
+            database::append_practice_session,
             settings::read_settings,
             settings::write_settings,
             scan_library,

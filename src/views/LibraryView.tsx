@@ -316,6 +316,13 @@ const thumbnailTagSummary = (
       : [];
     return [focusRegion.tag, ...details].filter(Boolean).join(' · ');
   }
+  if (tags.includes('人体局部')) {
+    return [
+      firstSummaryTag(tags, BODY_PART_TAGS) || '人体局部',
+      firstSummaryTag(tags, GENDER_SUMMARY_TAGS),
+      firstSummaryTag(tags, CAMERA_SUMMARY_TAGS),
+    ].filter(Boolean).join(' · ');
+  }
   return [
     firstSummaryTag(tags, GENDER_SUMMARY_TAGS),
     firstSummaryTag(tags, POSE_SUMMARY_TAGS),
@@ -1290,8 +1297,12 @@ export const LibraryView: React.FC<{
         </div>
 
         {(() => {
-          const currentTaskError = taggingTask.error || localizationTask.error;
-          const currentTaskMsg = taggingTask.message || localizationTask.message;
+          const currentTaskError = taggingTask.running
+            ? taggingTask.error
+            : localizationTask.running ? localizationTask.error : taggingTask.error || localizationTask.error;
+          const currentTaskMsg = taggingTask.running
+            ? taggingTask.message
+            : localizationTask.running ? localizationTask.message : taggingTask.message || localizationTask.message;
           const activeNotice = notice
             || (currentTaskError && !dismissedMessages.has(currentTaskError) ? currentTaskError : null)
             || (currentTaskMsg && !dismissedMessages.has(currentTaskMsg) ? currentTaskMsg : null);

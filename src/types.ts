@@ -41,6 +41,8 @@ export interface AppSettings {
   customTags: string[];
   practiceContentTypes?: string[];
   prioritizeUndrawnImages?: boolean;
+  inferencePerformance: 'responsive' | 'balanced' | 'maximum';
+  gpuInferenceEnabled: boolean;
 }
 
 export type BodyPartTag = '手' | '足' | '臂' | '腿' | '躯干' | '头部面部' | '骨盆臀部';

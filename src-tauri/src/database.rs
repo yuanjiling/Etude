@@ -423,6 +423,98 @@ pub fn write_app_state(app: tauri::AppHandle, data: String) -> Result<(), String
     save_state_path(&database_path(&app)?, &state)
 }
 
+fn append_practice_session_path(path: &Path, session: &Value) -> Result<(), String> {
+    let Some(id) = string(session, "id") else {
+        return Err("练习记录缺少 ID".to_string());
+    };
+    let mut connection = open(path)?;
+    let tx = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+
+    tx.execute("DELETE FROM practice_sessions WHERE id = ?1", [&id])
+        .map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO practice_sessions (id, started_at, duration_sec, image_count, record_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            id,
+            integer(session, "date").unwrap_or(0),
+            integer(session, "durationSec").unwrap_or(0),
+            integer(session, "imageCount").unwrap_or(0),
+            serde_json::to_string(session).map_err(|error| error.to_string())?,
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+
+    let items: Vec<(Value, Option<Value>)> =
+        if let Some(items) = session.get("items").and_then(Value::as_array) {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("image")
+                        .cloned()
+                        .map(|image| (image, item.get("focusRegion").cloned()))
+                })
+                .collect()
+        } else {
+            session
+                .get("images")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .map(|image| (image, None))
+                .collect()
+        };
+    let mut practice_counts = std::collections::HashMap::<String, i64>::new();
+    for (position, (image, focus_region)) in items.into_iter().enumerate() {
+        let Some(image_id) = string(&image, "id") else {
+            continue;
+        };
+        *practice_counts.entry(image_id.clone()).or_default() += 1;
+        tx.execute(
+            "INSERT INTO practice_history (session_id, position, image_id, image_snapshot_json, focus_region_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                position as i64,
+                image_id,
+                serde_json::to_string(&image).map_err(|error| error.to_string())?,
+                focus_region.map(|region| serde_json::to_string(&region)).transpose().map_err(|error| error.to_string())?,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+
+    let seen_at = integer(session, "date").unwrap_or(0);
+    for (image_id, increment) in practice_counts {
+        tx.execute(
+            "UPDATE images
+             SET practice_count = practice_count + ?1,
+                 last_seen = ?2,
+                 record_json = json_set(record_json, '$.practice_count', practice_count + ?1, '$.last_seen', ?2)
+             WHERE id = ?3",
+            params![increment, seen_at, image_id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+
+    tx.commit().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn append_practice_session(app: tauri::AppHandle, data: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = DATABASE_LOCK
+            .lock()
+            .map_err(|_| "数据库写入锁已损坏".to_string())?;
+        let session: Value =
+            serde_json::from_str(&data).map_err(|error| format!("练习记录无效：{error}"))?;
+        append_practice_session_path(&database_path(&app)?, &session)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,6 +552,76 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn append_practice_session_updates_only_referenced_images() {
+        let directory =
+            std::env::temp_dir().join(format!("etude-session-append-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("etude.db");
+        save_state_path(
+            &path,
+            &json!({
+                "images": [
+                    {"id":"img-1","url":"asset://one","tags":[],"practice_count":2,"favorite":false,"hidden":false,"skip_count":0},
+                    {"id":"img-2","url":"asset://two","tags":[],"practice_count":4,"favorite":false,"hidden":false,"skip_count":0}
+                ],
+                "sets": [],
+                "history": []
+            }),
+        )
+        .unwrap();
+
+        append_practice_session_path(
+            &path,
+            &json!({
+                "id": "session-1",
+                "date": 456,
+                "durationSec": 30,
+                "imageCount": 2,
+                "images": [{"id":"img-1","url":"asset://one"},{"id":"img-1","url":"asset://one"}],
+                "items": [
+                    {"image":{"id":"img-1","url":"asset://one"}},
+                    {"image":{"id":"img-1","url":"asset://one"}}
+                ]
+            }),
+        )
+        .unwrap();
+
+        let connection = open(&path).unwrap();
+        let first: (i64, i64, String) = connection
+            .query_row(
+                "SELECT practice_count, last_seen, record_json FROM images WHERE id = 'img-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((first.0, first.1), (4, 456));
+        assert_eq!(
+            serde_json::from_str::<Value>(&first.2).unwrap()["practice_count"],
+            4
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT practice_count FROM images WHERE id = 'img-2'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM practice_history", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
         );
         drop(connection);
         fs::remove_dir_all(directory).unwrap();

@@ -22,6 +22,7 @@ export const TAG_CATEGORIES = [
   { name: '景别', tags: ['全身', '身体裁切', '头肩肖像'] },
   { name: '姿势', tags: ['站', '坐', '跪', '蹲', '躺'] },
   { name: '动态', tags: ['静态', '动态'] },
+  { name: '道具', tags: ['无道具', '有道具'] },
   { name: '机位', tags: ['平视', '俯视', '仰视'] },
   { name: '视角', tags: ['正面', '背面', '纯侧面'] },
   ...GENERAL_REFERENCE_CATEGORIES,
@@ -34,6 +35,7 @@ export const FIGURE_TAG_GROUPS: readonly (readonly string[])[] = [
   ['裸体', '部分着装', '完整着装'],
   ['站', '坐', '跪', '蹲', '躺'],
   ['静态', '动态'],
+  ['无道具', '有道具'],
   ['平视', '俯视', '仰视'],
   ['正面', '背面', '纯侧面'],
 ];
@@ -44,6 +46,7 @@ export const PART_TAG_GROUPS: readonly (readonly string[])[] = [
   ['裸体', '部分着装', '完整着装'],
   ['站', '坐', '跪', '蹲', '躺'],
   ['静态', '动态'],
+  ['无道具', '有道具'],
   ['平视', '俯视', '仰视'],
   ['正面', '背面', '纯侧面'],
 ];

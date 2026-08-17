@@ -1,6 +1,7 @@
 import type { ObjectDetector } from '@mediapipe/tasks-vision';
 import type { ContentRoutingAnalysis, ImageRecord, PersonDetectionBox, PoseAnalysis, VisualAnalysis } from '../types';
 import { analyzePoseFocus, POSE_MODEL_VERSION } from './poseFocus';
+import type { InferenceRunOptions } from '../utils/inference';
 
 export const CONTENT_ROUTER_VERSION = 'mediapipe-efficientdet-lite0-rules-v1';
 export const VISUAL_ANALYSIS_VERSION = 'canvas-lab-lightness-aspect-v3';
@@ -15,7 +16,8 @@ export const isAnalysisComplete = (image: ImageRecord): boolean => {
 
 const PERSON_SCORE_THRESHOLD = 0.35;
 const MAX_INFERENCE_EDGE = 1440;
-let detectorPromise: Promise<ObjectDetector> | null = null;
+type DetectorRuntime = { detector: ObjectDetector; backend: 'GPU' | 'CPU'; fallbackReason?: string };
+const detectorPromises = new Map<'gpu' | 'cpu', Promise<DetectorRuntime>>();
 
 const clamp = (value: number, min = 0, max = 1) => Math.min(max, Math.max(min, value));
 
@@ -46,20 +48,35 @@ const yieldForBrowserFrame = () => new Promise<void>(resolve => {
   requestAnimationFrame(() => window.setTimeout(resolve, 0));
 });
 
-const getDetector = () => {
-  if (!detectorPromise) {
-    detectorPromise = import('@mediapipe/tasks-vision').then(async ({ FilesetResolver, ObjectDetector }) => {
+const getDetector = (preferGpu: boolean) => {
+  const key = preferGpu ? 'gpu' : 'cpu';
+  let runtime = detectorPromises.get(key);
+  if (!runtime) {
+    runtime = import('@mediapipe/tasks-vision').then(async ({ FilesetResolver, ObjectDetector }) => {
       const wasm = await FilesetResolver.forVisionTasks('/mediapipe');
-      return ObjectDetector.createFromOptions(wasm, {
-        baseOptions: { modelAssetPath: '/models/efficientdet_lite0_uint8.tflite', delegate: 'CPU' },
-        runningMode: 'IMAGE',
-        scoreThreshold: PERSON_SCORE_THRESHOLD,
-        maxResults: 10,
-        categoryAllowlist: ['person'],
-      });
+      const create = (delegate: 'GPU' | 'CPU') => ObjectDetector.createFromOptions(wasm, {
+          baseOptions: { modelAssetPath: '/models/efficientdet_lite0_uint8.tflite', delegate },
+          runningMode: 'IMAGE',
+          scoreThreshold: PERSON_SCORE_THRESHOLD,
+          maxResults: 10,
+          categoryAllowlist: ['person'],
+        });
+      if (preferGpu) {
+        try {
+          return { detector: await create('GPU'), backend: 'GPU' as const };
+        } catch (error) {
+          return {
+            detector: await create('CPU'),
+            backend: 'CPU' as const,
+            fallbackReason: `人物检测 GPU 初始化失败：${String(error)}`,
+          };
+        }
+      }
+      return { detector: await create('CPU'), backend: 'CPU' as const };
     });
+    detectorPromises.set(key, runtime);
   }
-  return detectorPromise;
+  return runtime;
 };
 
 const boxArea = (box: PersonDetectionBox) => box.width * box.height;
@@ -261,13 +278,24 @@ export const visualAnalysisTags = (analysis: VisualAnalysis) => [
   '综合参考', analysis.dominantColor, analysis.contrast, analysis.orientation, analysis.aspectRatioTag,
 ];
 
-export const analyzeContent = async (src: string) => {
-  const [detector, image] = await Promise.all([getDetector(), loadImage(src)]);
+export const analyzeContent = async (src: string, options: InferenceRunOptions) => {
+  let [runtime, image] = await Promise.all([getDetector(options.preferGpu), loadImage(src)]);
+  if (runtime.fallbackReason) options.onGpuFallback?.(runtime.fallbackReason);
   const inferenceImage = await prepareInferenceImage(image);
   try {
-    const detectionResult = detector.detect(inferenceImage.source);
+    let detectionResult;
+    try {
+      detectionResult = runtime.detector.detect(inferenceImage.source);
+    } catch (error) {
+      if (runtime.backend !== 'GPU') throw error;
+      const fallbackReason = `人物检测 GPU 执行失败：${String(error)}`;
+      options.onGpuFallback?.(fallbackReason);
+      runtime = { ...await getDetector(false), fallbackReason };
+      detectorPromises.set('gpu', Promise.resolve(runtime));
+      detectionResult = runtime.detector.detect(inferenceImage.source);
+    }
     await yieldForBrowserFrame();
-    const poseAnalysis = await analyzePoseFocus(inferenceImage.source);
+    const poseAnalysis = await analyzePoseFocus(inferenceImage.source, options);
     const width = Math.max(1, 'naturalWidth' in inferenceImage.source
       ? inferenceImage.source.naturalWidth
       : inferenceImage.source.width);
